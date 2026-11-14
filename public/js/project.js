@@ -2,6 +2,7 @@
 import { makeCard, listItems, buildTranslatedCard, exportCardJson, exportCardPng } from './core/card.js';
 import { scanCard, mergeScan, makeDictIndex, findConflicts } from './core/dict.js';
 import { analyzeItem } from './core/analyze.js';
+import { validateSegment, allowedHanSet } from './core/translate.js';
 import { uuid, hasCJK, deepClone } from './core/util.js';
 import { utf8ToBase64 } from './core/png.js';
 
@@ -88,7 +89,29 @@ export class Project {
     this.scan = scanCard(this.card, this.items);
     this.data.dict = mergeScan(this.data.dict, this.scan.entries);
     this.analyze(settings);
+    this.recheckWarnings(settings);
     return this.scan;
+  }
+
+  /** Kiểm tra lại toàn bộ bản dịch đã có (vd bản dịch cũ còn sót chữ Hán) -> cập nhật cảnh báo */
+  recheckWarnings(settings = this.settings) {
+    const allowed = allowedHanSet(this.data.dict, settings, this.data.glossary);
+    let n = 0;
+    for (const [key, text] of this.tm) {
+      const e = this.segByKey?.get(key);
+      if (!e) continue;
+      const v = validateSegment(e.seg, text, allowed);
+      const w = v.ok ? v.warn : v.reason;
+      if (w) { if (this.data.warnings[key] !== w) n++; this.data.warnings[key] = w; }
+      else delete this.data.warnings[key];
+    }
+    if (n) { this.bump(); this.touch(); }
+    return n;
+  }
+
+  /** Các đoạn (thuộc mục được dịch) chưa dịch hoặc có lỗi/cảnh báo */
+  problemSegments() {
+    return this.segmentsFor().filter((s) => !this.tm.has(s.key) || this.data.warnings[s.key]);
   }
 
   dictIndex(settings) { return makeDictIndex(this.data.dict, settings); }

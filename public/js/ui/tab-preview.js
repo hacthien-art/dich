@@ -5,7 +5,7 @@ import { evaluateMacros } from '../core/macros.js';
 import { applyMvuUpdates } from '../core/mvu.js';
 import { analyzeItem } from '../core/analyze.js';
 import { runTranslation } from '../core/translate.js';
-import { formatMessage, buildFrameDoc, FRAME_SANDBOX, MESSAGE_CSS, vendorSources } from '../preview/render.js';
+import { formatMessage, mountFrame, markFrameOriginBroken, FRAME_SANDBOX, MESSAGE_CSS } from '../preview/render.js';
 import { validateSchema } from '../preview/sandbox.js';
 import { load as yamlLoad } from '../../vendor/js-yaml.mjs';
 import { hasCJK, truncate } from '../core/util.js';
@@ -252,7 +252,7 @@ export function create(app, el) {
     for (const [id, f] of frames) if (f.side === side) frames.delete(id);
     clear(col.chatEl);
     col.chatEl.append(h('div', { class: 'muted small' }, 'Đang chuẩn bị biến…'));
-    const [base, libs] = await Promise.all([baseStat(side), vendorSources(['jquery', 'lodash', 'yaml', 'env'])]);
+    const base = await baseStat(side);
     clear(col.chatEl);
     const scripts = scriptsFor(side);
     const user = app.ts().userName || 'User';
@@ -287,12 +287,23 @@ export function create(app, el) {
         iframe.setAttribute('sandbox', FRAME_SANDBOX);
         iframe.setAttribute('loading', 'lazy');
         iframe.style.height = '120px';
-        iframe.srcdoc = buildFrameDoc(code, {
-          frameId: fid, messageId: i, stat_data: stats[i], chat: frameChat, charName: macro.char, userName: user,
+        const vh = Math.max(500, window.innerHeight - 160);
+        const fdata = {
+          frameId: fid, messageId: i, stat_data: stats[i], chat: frameChat, charName: macro.char, userName: user, viewportHeight: vh,
           bookName: side === 'orig' ? p.card.raw.data.character_book?.name : translatedCard().data.character_book?.name,
-        }, { viewportHeight: Math.max(500, window.innerHeight - 160) }, libs);
-        frames.set(fid, { side, index: i, iframe });
+        };
+        const f = { side, index: i, iframe, ready: false };
+        frames.set(fid, f);
         slot.appendChild(iframe);
+        const fallback = () => {
+          if (f.ready || !iframe.isConnected || !frames.has(fid)) return;
+          markFrameOriginBroken();
+          plog(side, 'Iframe từ cổng riêng không tải được (bị tường lửa/tiện ích chặn?) → chuyển sang chế độ sandbox dự phòng (không có IndexedDB).', 'warn');
+          mountFrame(iframe, code, fdata, { viewportHeight: vh, forceInline: true }).catch(() => {});
+        };
+        mountFrame(iframe, code, fdata, { viewportHeight: vh })
+          .then((mode) => { if (mode === 'origin') iframe.addEventListener('load', () => setTimeout(fallback, 3000), { once: true }); })
+          .catch((e) => plog(side, 'Không tạo được iframe: ' + e.message, 'error'));
       });
       const head = h('div', { class: 'mes-head' },
         h('span', { class: 'who' }, m.role === 'user' ? '🧑 ' + user : '🤖 ' + macro.char),
@@ -346,7 +357,15 @@ export function create(app, el) {
       case 'toast': plog(side, `[toast ${d.level}] ${d.title ? d.title + ': ' : ''}${d.message}`, d.level); break;
       case 'log': plog(side, '[lỗi script] ' + d.message, 'error'); break;
       case 'vars': plog(side, 'Script cập nhật biến (' + (d.option?.type || 'chat') + ')', 'info'); break;
+      case 'ready': f.ready = true; break;
       case 'slash': runSlash(side, d.cmd); break;
+      case 'sendText': {
+        const text = String(d.text || '');
+        chat.push({ role: 'user', orig: side === 'orig' ? text : '', tr: side === 'tr' ? text : '' });
+        plog(side, '#send_but (parent.document): gửi "' + truncate(text, 140) + '" — trong ST sẽ gọi AI trả lời (xem trước không gọi AI).', 'ok');
+        setTimeout(() => renderSide(side), 30);
+        break;
+      }
       case 'setChat': {
         let rerender = false;
         for (const x of d.list || []) {

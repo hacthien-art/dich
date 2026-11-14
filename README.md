@@ -7,8 +7,10 @@ dịch đầy đủ mọi phần của card, **đồng bộ tên biến** ở m�
 
 1. Cài [Node.js](https://nodejs.org) (bản LTS, ≥ 18).
 2. Bấm đúp **`Start.bat`** → trình duyệt tự mở `http://127.0.0.1:8686/`.
-   (Hoặc chạy `node server.js`. Đổi cổng: `node server.js --port 8687`.)
+   (Hoặc chạy `node server.js`. Đổi cổng: `node server.js --port 8690` — cổng iframe xem trước sẽ là cổng + 1.)
 3. Đóng cửa sổ console để tắt app.
+
+Cập nhật bản mới: `git pull` (hoặc tải lại zip) rồi chạy lại `Start.bat`; dữ liệu trong `data/` được giữ nguyên.
 
 Không cần `npm install` — thư viện đã nằm sẵn trong `public/vendor/`.
 
@@ -25,6 +27,10 @@ Không cần `npm install` — thư viện đã nằm sẵn trong `public/vendor
 4. **🧬 Biến & Đồng bộ** — xem bảng biến MVU / giá trị enum / nhãn regex / thuật ngữ, chọn kiểu đặt tên,
    bấm **✨ AI gợi ý**, sửa tay nếu muốn, **🧪 Kiểm tra schema Zod** (chạy schema của card với InitVar gốc & sau dịch).
 5. **▶ Dịch toàn bộ** (thanh trên cùng). App tự gợi ý từ điển còn trống rồi dịch theo lô, song song, có thử lại.
+   Mỗi đoạn được kiểm tra: đủ placeholder, đủ macro, **không còn sót chữ Hán** (kể cả trong tên thẻ như
+   `<姬悠馨_id40>`). Đoạn lỗi được tự dịch lại kèm ghi chú lỗi cho AI; nếu vẫn lỗi thì được gắn ⚠.
+   Bấm **🔁 Dịch chỗ thiếu/lỗi (N)** để dịch lại riêng các đoạn chưa dịch hoặc bị ⚠ (bản cũ được giữ nếu dịch lại hỏng).
+   Trong tab Card có nút **🔁 Dịch đoạn lỗi** cho từng mục và bộ lọc *“Chỉ hiện mục chưa dịch xong / có lỗi”*.
 6. **🧩 Regex & Xem trước** — bấm **🧪 Thử** ở từng regex, hoặc dán tin nhắn AI mẫu → so sánh 2 cột
    *Bản gốc | Bản dịch*: regex áp dụng như ST (placement, chỉ hiển thị/chỉ prompt, độ sâu, `$1`, `{{match}}`),
    khối HTML chạy trong iframe với API giả lập Tavern Helper + MVU (`getVariables`, `getAllVariables`,
@@ -57,7 +63,13 @@ Muốn an toàn tuyệt đối: chọn *“Giữ nguyên tiếng Trung”* cho t
 ## Lưu ý
 
 - Mật khẩu proxy lưu trong `data/settings/app.json` trên máy bạn — đừng chia sẻ thư mục `data/`.
-- Iframe xem trước chạy trong sandbox, không truy cập được app/khóa API.
+- Iframe xem trước chạy trên **cổng riêng** (mặc định 8687, khác origin với app) nên code của card không đọc được
+  app/khóa API, nhưng vẫn có `localStorage`/`IndexedDB` thật. `window.parent`/`window.top` được giả lập giống ST
+  (`#chat`, `#send_textarea`, `#send_but`…): card gửi tin qua `parent.document` vẫn hoạt động trong khung xem trước.
+  Nếu cổng 8687 bị chặn, app tự chuyển sang iframe sandbox dự phòng (không có IndexedDB).
+- Tiện ích dịch trình duyệt (vd *Immersive Translate*) có thể chèn vào iframe và báo lỗi đỏ trong Console
+  (`content_main.js`, `[frame-bridge]`) — không phải lỗi của app; nên tắt tiện ích đó cho `127.0.0.1`.
 - Xem trước **không gọi AI** cho `/trigger`, `generate()`; chỉ mô phỏng.
+- Lỗi phía server được ghi vào `data/server.log` (gửi file này khi báo lỗi).
 - Regex literal chứa tiếng Trung trong mã JS (vd `/第([一二三])章/`) không tự dịch được — app sẽ cảnh báo để bạn kiểm tra.
 - Kiểm thử: `npm test` (chạy trên các file card `.json` đặt ở thư mục gốc).

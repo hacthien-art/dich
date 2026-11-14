@@ -1,5 +1,5 @@
 // Kiểm thử phần đọc phản hồi AI, kiểm tra placeholder, dựng prompt theo preset ST, cập nhật biến MVU
-import { parseTagged, validateSegment, makeBatches } from '../public/js/core/translate.js';
+import { parseTagged, validateSegment, makeBatches, leftoverHan } from '../public/js/core/translate.js';
 import { buildMessages, importPreset, exportPreset, postProcess } from '../public/js/core/preset.js';
 import { evaluateMacros } from '../public/js/core/macros.js';
 import { applyMvuUpdates } from '../public/js/core/mvu.js';
@@ -26,6 +26,14 @@ eq(validateSegment(seg, 'Hảo cảm ⟦1⟧ ⟦1⟧ {{user}}').ok, false, 'lặ
 eq(validateSegment(seg, 'Hảo cảm hiện tại: ⟦1⟧').soft, true, 'mất {{user}} -> lỗi mềm');
 eq(validateSegment(seg, 'Hảo cảm hiện tại: [[1]], {{user}}').ok, true, 'chuẩn hóa [[1]] -> ⟦1⟧');
 eq(makeBatches([{ key: 'a'.repeat(10) }, { key: 'b'.repeat(10) }, { key: 'c'.repeat(10) }], 25, 10).map((b) => b.length), [2, 1], 'chia lô theo số ký tự');
+
+// ---- còn sót chữ Hán (vd tên thẻ <姬悠馨_id40> bị giữ nguyên)
+const segTag = { key: '<姬悠馨_id40>\n<character:姬悠馨>\n身份：转学生', holes: [] };
+const vLeft = validateSegment(segTag, '<姬悠馨_id40>\n<character:姬悠馨>\nThân phận: học sinh chuyển trường');
+eq([vLeft.ok, vLeft.soft, vLeft.leftover], [false, true, ['姬悠馨']], 'phát hiện chữ Hán còn sót trong tên thẻ -> lỗi mềm để dịch lại');
+eq(validateSegment(segTag, '<Cơ Du Hinh_id40>\n<character:Cơ Du Hinh>\nThân phận: học sinh chuyển trường').ok, true, 'dịch cả chữ Hán trong thẻ -> hợp lệ');
+eq(validateSegment(segTag, '<姬悠馨_id40>\n<character:姬悠馨>\nThân phận: học sinh', new Set(['姬悠馨'])).ok, true, 'từ được phép giữ nguyên (thuật ngữ "giữ") không bị báo lỗi');
+eq(leftoverHan('Xin chào ⟦1⟧ 世界 và 世界'), ['世界'], 'liệt kê cụm chữ Hán còn sót (không trùng)');
 
 // ---- macro
 eq(evaluateMacros('{{setvar::x::1}}{{addvar::x::2}}{{getvar::x}}|{{user}}|{{// bỏ}}|{{char}}', { user: 'A', char: 'B' }), '3|A||B', 'macro biến + user/char + chú thích');

@@ -247,7 +247,16 @@ export function lexHtml(src, start = 0, end = src.length) {
         attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: -1, vEnd: -1, quote: '' });
       }
     }
-    if (!closed) { i++; continue; } // không phải thẻ hợp lệ -> coi như văn bản
+    if (!closed) {
+      if (k >= end) {
+        // thẻ dở dang tới hết đoạn (vd mảnh HTML trong chuỗi JS: '<input value="' + x) -> giữ nguyên, không phải chữ
+        flushText(i);
+        tokens.push({ type: 'partial', start: i, end });
+        i = end; textStart = end;
+        break;
+      }
+      i++; continue; // không phải thẻ hợp lệ -> coi như văn bản
+    }
     flushText(i);
     tokens.push({ type: 'tag', start: i, end: k, name, lower, close: isClose, selfClose, attrs });
     i = k; textStart = i;

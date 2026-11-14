@@ -120,6 +120,7 @@ function bindChrome() {
   document.getElementById('btnImport').addEventListener('click', () => { fileInp.value = ''; fileInp.click(); });
   fileInp.addEventListener('change', () => { if (fileInp.files[0]) importFile(fileInp.files[0]); });
   document.getElementById('btnTranslateAll').addEventListener('click', () => translateAll());
+  document.getElementById('btnRetry').addEventListener('click', () => translateAll(null, { problems: true }));
   document.getElementById('btnStop').addEventListener('click', () => stopRun());
   document.getElementById('btnProjects').addEventListener('click', () => projectsDialog());
   const dd = document.getElementById('btnExport').parentElement;
@@ -287,7 +288,8 @@ export async function runDictSuggest(entries) {
   }
 }
 
-export async function translateAll(itemIds, { force = false } = {}) {
+/** problems=true: chỉ dịch các đoạn chưa dịch hoặc có lỗi/cảnh báo (vd còn sót chữ Hán) — giữ bản cũ nếu dịch lại thất bại */
+export async function translateAll(itemIds, { force = false, problems = false } = {}) {
   const p = app.project;
   if (!p) return toast('Hãy nhập card trước', 'warn');
   if (app.running) return toast('Đang dịch...', 'warn');
@@ -307,14 +309,19 @@ export async function translateAll(itemIds, { force = false } = {}) {
         if (ac.signal.aborted) return;
       }
     }
+    p.recheckWarnings(ts);
     const segs = p.segmentsFor(itemIds);
     if (force) p.clearTranslations(segs.map((s) => s.key));
-    const todo = segs.filter((s) => !p.tm.has(s.key));
-    app.log(`Bước 2: dịch ${todo.length} đoạn (${todo.reduce((n, s) => n + s.key.length, 0)} ký tự)`, 'info');
+    const todo = problems ? segs.filter((s) => !p.tm.has(s.key) || p.data.warnings[s.key]) : segs.filter((s) => !p.tm.has(s.key));
+    // ghi chú lỗi cũ (vd "còn sót chữ Hán: ...") gửi kèm để AI sửa đúng chỗ
+    const notes = new Map();
+    for (const s of todo) if (p.data.warnings[s.key]) notes.set(s.key, p.data.warnings[s.key]);
+    if (!todo.length) { toast(problems ? 'Không còn đoạn nào chưa dịch hoặc bị lỗi ✓' : 'Đã dịch hết ✓', 'ok'); return; }
+    app.log(`Bước 2: dịch ${todo.length} đoạn${problems ? ` (gồm ${notes.size} đoạn lỗi/cảnh báo)` : ''} (${todo.reduce((n, s) => n + s.key.length, 0)} ký tự)`, 'info');
     let lastRefresh = 0;
     const res = await runTranslation({
       segments: todo, tm: new Map(p.tm), settings: ts, conn, preset: app.preset.data, dict: p.data.dict, cardName: p.cardName,
-      glossary: p.data.glossary, signal: ac.signal,
+      glossary: p.data.glossary, signal: ac.signal, force: problems, notes,
       onResult: (key, text, warn) => {
         p.setTranslation(key, text, warn);
         app.saveProject();
@@ -327,9 +334,11 @@ export async function translateAll(itemIds, { force = false } = {}) {
     });
     const secs = ((Date.now() - t0) / 1000).toFixed(0);
     if (res.aborted) toast('Đã dừng dịch', 'warn');
-    else if (res.failed) toast(`Xong với ${res.failed} đoạn lỗi (${secs}s). Xem tab Nhật ký, có thể bấm Dịch toàn bộ lần nữa để thử lại phần lỗi.`, 'warn', 9000);
+    const warned = todo.filter((s) => p.data.warnings[s.key]).length;
+    if (res.aborted) toast('Đã dừng dịch', 'warn');
+    else if (res.failed || warned) toast(`Xong: ${res.failed} đoạn lỗi, ${warned} đoạn còn cảnh báo (${secs}s). Bấm "🔁 Dịch chỗ thiếu/lỗi" để thử lại riêng các đoạn này.`, 'warn', 9000);
     else toast(`Dịch xong ${res.done} đoạn trong ${secs}s ✓`, 'ok', 6000);
-    app.log(`Hoàn tất: ${res.done} xong, ${res.failed} lỗi, ${secs}s`, res.failed ? 'warn' : 'ok');
+    app.log(`Hoàn tất: ${res.done} xong, ${res.failed} lỗi, ${warned} cảnh báo, ${secs}s`, res.failed || warned ? 'warn' : 'ok');
   } catch (e) {
     console.error(e);
     toast('Lỗi dịch: ' + e.message, 'err', 9000);
@@ -361,10 +370,16 @@ export function updateTopbar() {
   document.getElementById('btnTranslateAll').disabled = !p || !!app.running;
   document.getElementById('btnExport').disabled = !p;
   document.getElementById('btnStop').hidden = !app.running;
+  const retry = document.getElementById('btnRetry');
+  const probs = p ? p.problemSegments() : [];
+  const warned = p ? probs.filter((s) => p.tm.has(s.key)).length : 0;
+  retry.disabled = !p || !!app.running || !probs.length;
+  retry.textContent = `🔁 Dịch chỗ thiếu/lỗi (${probs.length})`;
+  retry.title = p ? `${probs.length - warned} đoạn chưa dịch + ${warned} đoạn lỗi/còn sót chữ Hán` : '';
   if (!app.running) {
     if (p) {
       const st = p.stats();
-      setProgress(st.done, st.total, st.done < st.total ? `· còn ~${st.remainingChars} ký tự` : '✓ đã dịch hết');
+      setProgress(st.done, st.total, (st.done < st.total ? `· còn ~${st.remainingChars} ký tự` : '✓ đã dịch hết') + (warned ? ` · ⚠ ${warned} đoạn cần dịch lại` : ''));
     } else document.getElementById('progressWrap').hidden = true;
   }
 }

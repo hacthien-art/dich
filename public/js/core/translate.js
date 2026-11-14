@@ -2,7 +2,7 @@
 import { chat } from './api.js';
 import { buildMessages } from './preset.js';
 import { PH_RE } from './analyze.js';
-import { countCJK, hasCJK, sleep } from './util.js';
+import { countCJK, hasCJK, sleep, HAN_CLASS } from './util.js';
 import { glossaryFor, makeDictIndex, applyStyle, sanitizeName } from './dict.js';
 
 export const NAME_RULES = {
@@ -17,12 +17,14 @@ export const DEFAULT_PROMPTS = {
 
 QUY TẮC BẮT BUỘC:
 1. Dịch tự nhiên, trôi chảy, đúng văn phong của từng loại nội dung (lời kể/lời thoại nhập vai, chỉ dẫn cho AI, chữ trên giao diện, tên mục...). Văn phong tiểu thuyết mạng tiếng Việt, xưng hô phù hợp ngữ cảnh.
-2. Giữ NGUYÊN không đổi: placeholder dạng ⟦số⟧, macro {{...}}, thẻ <...>, ký hiệu $1, markdown (**, *, #, -, >), emoji, ký tự đầu dòng, xuống dòng, thụt lề, cấu trúc YAML/JSON (dấu :, -, |, ngoặc, dấu phẩy).
-3. Mỗi placeholder ⟦số⟧ phải xuất hiện ĐÚNG 1 lần trong bản dịch; được đổi vị trí cho đúng ngữ pháp tiếng Việt.
-4. Dùng CHÍNH XÁC bản dịch trong bảng thuật ngữ. Mục đánh dấu [biến] là tên biến/khóa dữ liệu: khi văn bản nói tới biến/trường đó phải viết đúng từng ký tự.
-5. Tên riêng: {{name_rule}}
-6. Phần đã là tiếng Việt, tiếng Anh, số, mã lệnh → giữ nguyên. Nếu chỉ dẫn yêu cầu AI xuất tiếng Trung hoặc giữ tên khóa bằng tiếng Trung, hãy chuyển thành yêu cầu dùng tiếng Việt cho phù hợp.
-7. Chỉ trả về kết quả theo đúng định dạng được yêu cầu, không giải thích.`,
+2. Giữ NGUYÊN không đổi: placeholder dạng ⟦số⟧, macro {{...}}, thẻ có tên tiếng Anh (vd <div>, <user>, <UpdateVariable>, </b>), ký hiệu $1, markdown (**, *, #, -, >), emoji, ký tự đầu dòng, xuống dòng, thụt lề, cấu trúc YAML/JSON (dấu :, -, |, ngoặc, dấu phẩy).
+3. KHÔNG được để sót chữ Hán: kể cả chữ Hán nằm TRONG thẻ hoặc tên thẻ (vd <姬悠馨_id40> → <Cơ Du Hinh_id40>, <character:李明> → <character:Lý Minh>), trong ngoặc 「」『』【】, trong tiêu đề, danh sách… đều phải dịch; giữ nguyên ký hiệu < > : _ / và số.
+4. Mỗi placeholder ⟦số⟧ phải xuất hiện ĐÚNG 1 lần trong bản dịch; được đổi vị trí cho đúng ngữ pháp tiếng Việt.
+5. Dùng CHÍNH XÁC bản dịch trong bảng thuật ngữ. Mục đánh dấu [biến] là tên biến/khóa dữ liệu: khi văn bản nói tới biến/trường đó phải viết đúng từng ký tự. Mục có bản dịch giống hệt bản gốc thì giữ nguyên.
+6. Tên riêng: {{name_rule}}
+7. Phần đã là tiếng Việt, tiếng Anh, số, mã lệnh → giữ nguyên. Nếu chỉ dẫn yêu cầu AI xuất tiếng Trung hoặc giữ tên khóa bằng tiếng Trung, hãy chuyển thành yêu cầu dùng tiếng Việt cho phù hợp.
+8. Nếu thẻ <seg> có thuộc tính note thì đó là lỗi của lần dịch trước — phải sửa đúng lỗi đó.
+9. Chỉ trả về kết quả theo đúng định dạng được yêu cầu, không giải thích.`,
   task: `Card: {{card_name}}
 Loại đoạn: prose = văn bản/chỉ dẫn; ui = chữ trên giao diện HTML (ngắn gọn); name = tên/tiêu đề; keyword = từ khóa kích hoạt lorebook (ngắn, dễ khớp); desc = mô tả biến cho AI.
 
@@ -89,8 +91,31 @@ function visibleTokens(s) {
   return toks;
 }
 
-/** Kiểm tra bản dịch 1 đoạn */
-export function validateSegment(seg, out) {
+const HAN_RUN_RE = new RegExp('[' + HAN_CLASS + ']+', 'g');
+
+/** Các cụm chữ Hán còn sót trong bản dịch (bỏ qua placeholder và các từ được phép giữ nguyên) */
+export function leftoverHan(out, allowed) {
+  const text = String(out ?? '').replace(PH_RE, ' ');
+  const runs = [...new Set(text.match(HAN_RUN_RE) || [])];
+  if (!allowed || !allowed.size) return runs;
+  return runs.filter((r) => { for (const a of allowed) if (a.includes(r)) return false; return true; });
+}
+
+/** Tập các từ tiếng Trung được phép giữ nguyên (mục từ điển "giữ nguyên", thuật ngữ cố ý để tiếng Trung) */
+export function allowedHanSet(dict, settings = {}, glossary = []) {
+  const idx = makeDictIndex(dict || {}, settings);
+  const out = new Set();
+  for (const src of Object.keys(dict || {})) {
+    const dst = idx.lookup(src);
+    if (dst && hasCJK(dst)) out.add(dst);
+    if (dst === src) out.add(src);
+  }
+  for (const g of glossary || []) if (g.dst && hasCJK(g.dst)) out.add(g.dst);
+  return out;
+}
+
+/** Kiểm tra bản dịch 1 đoạn. allowed: Set các từ tiếng Trung được phép còn lại */
+export function validateSegment(seg, out, allowed) {
   const n = seg.holes?.length || (seg.key.match(PH_RE) || []).length;
   if (out == null) return { ok: false, reason: 'thiếu trong phản hồi' };
   out = normalizePlaceholders(out);
@@ -114,10 +139,12 @@ export function validateSegment(seg, out) {
       pool.set(t, c - 1);
     }
   }
-  const srcHan = countCJK(seg.key), outHan = countCJK(out);
+  const srcHan = countCJK(seg.key);
   if (srcHan >= 4 && out.trim() === seg.key.trim()) return { ok: false, reason: 'giữ nguyên bản gốc (chưa dịch)', out, soft: true };
-  const warn = srcHan >= 6 && outHan > Math.max(3, srcHan * 0.35) ? 'còn nhiều chữ Hán' : null;
-  return { ok: true, out, warn };
+  // còn sót chữ Hán (kể cả trong tên thẻ <姬悠馨_id40>) -> lỗi mềm: dịch lại kèm ghi chú, hết lượt thì nhận + cảnh báo
+  const left = leftoverHan(out, allowed);
+  if (left.length) return { ok: false, reason: 'còn sót chữ Hán: ' + left.slice(0, 6).join(', '), out, soft: true, leftover: left };
+  return { ok: true, out, warn: null };
 }
 
 export function normalizePlaceholders(s) {
@@ -131,6 +158,8 @@ export function normalizePlaceholders(s) {
  */
 export async function runTranslation(job) {
   const { settings: st, signal } = job;
+  job.notes ||= new Map();
+  job.allowed ||= allowedHanSet(job.dict, st, job.glossary);
   const pending = job.segments.filter((s) => job.force || !job.tm.has(s.key));
   const total = pending.length;
   let done = 0, failed = 0;
@@ -153,10 +182,13 @@ export async function runTranslation(job) {
         const res = await translateBatch(job, task.segs, wid);
         for (const [key, out, warn] of res.ok) {
           job.tm.set(key, out);
+          job.notes.delete(key);
           job.onResult?.(key, out, warn);
           done++;
         }
         const bad = res.bad;
+        // ghi chú lỗi để lần dịch lại AI biết phải sửa gì
+        for (const b of bad) if (b.reason) job.notes.set(b.seg.key, b.reason + (b.leftover ? ' — phải dịch nốt các chữ này' : ''));
         if (bad.length) {
           if (task.attempt < maxRetries) {
             const size = Math.max(1, Math.ceil(bad.length / (res.truncated ? 2 : 1)));
@@ -210,7 +242,10 @@ export function buildBatchMessages(job, segs) {
   const prompts = { ...DEFAULT_PROMPTS, ...(st.prompts || {}) };
   const nameRule = NAME_RULES[st.nameStyle || 'auto'];
   const glossary = glossaryFor(segs.map((s) => s.key), job.dict, st, job.glossary || []);
-  const segText = segs.map((s, i) => `<seg id="${i + 1}" type="${TYPE_ATTR[s.kind] || 'prose'}">${s.key}</seg>`).join('\n');
+  const segText = segs.map((s, i) => {
+    const note = job.notes?.get(s.key);
+    return `<seg id="${i + 1}" type="${TYPE_ATTR[s.kind] || 'prose'}"${note ? ` note="${escAttr('Lần dịch trước bị lỗi: ' + note)}"` : ''}>${s.key}</seg>`;
+  }).join('\n');
   const vars = { card_name: job.cardName || '', glossary: formatGlossary(glossary), segments: segText, name_rule: nameRule, target_lang: 'tiếng Việt' };
   const system = fillTemplate(prompts.system, vars);
   const task = fillTemplate(prompts.task, vars);
@@ -235,9 +270,9 @@ async function translateBatch(job, segs, wid) {
   const parsed = parseTagged(res.text, 'seg');
   const ok = [], bad = [];
   segs.forEach((seg, i) => {
-    const v = validateSegment(seg, parsed.get(i + 1));
+    const v = validateSegment(seg, parsed.get(i + 1), job.allowed);
     if (v.ok) ok.push([seg.key, v.out, v.warn]);
-    else bad.push({ seg, reason: v.reason, out: v.out, soft: v.soft });
+    else bad.push({ seg, reason: v.reason, out: v.out, soft: v.soft, leftover: v.leftover });
   });
   job.onLog?.(`Lô #${wid}: xong ${ok.length}/${segs.length} đoạn trong ${((Date.now() - t0) / 1000).toFixed(1)}s${res.truncated ? ' (bị cắt do giới hạn token)' : ''}`, bad.length ? 'warn' : 'ok');
   if (!parsed.size && res.text) job.onLog?.('Phản hồi không đúng định dạng: ' + res.text.slice(0, 300), 'error');

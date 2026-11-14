@@ -25,9 +25,12 @@
     if (!ok) { try { Object.defineProperty(window, name, { value: memStorage(), configurable: true }); } catch (e) { /* */ } }
   });
   var clone = function (o) { try { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); } catch (e) { return o; } };
+  // giữ tham chiếu cửa sổ app thật trước khi thay window.parent bằng bản giả lập kiểu ST
+  var realParent = window.parent;
   var send = function (type, payload) {
-    try { parent.postMessage(Object.assign({ __th: 1, frameId: frameId, type: type }, payload || {}), '*'); } catch (e) { /* */ }
+    try { realParent.postMessage(Object.assign({ __th: 1, frameId: frameId, type: type }, payload || {}), '*'); } catch (e) { /* */ }
   };
+  try { document.documentElement.setAttribute('translate', 'no'); } catch (e) { /* */ }
   var lodash = window._;
   var getPath = function (obj, path, def) {
     if (lodash && lodash.get) return lodash.get(obj, path, def);
@@ -281,6 +284,52 @@
   };
   window.SillyTavern = window.SillyTavern || { getContext: ctx };
   window.getContext = window.getContext || ctx;
+
+  // ------------------------------------------------------------------ window.parent giả lập kiểu SillyTavern
+  // Trong ST, iframe của Tavern Helper cùng origin nên card hay dùng window.parent.document (#send_textarea, #chat...).
+  // Ở đây app khác origin (để bảo vệ khóa API) -> tạo "cửa sổ cha" giả có DOM giống ST.
+  try {
+    var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); };
+    var pdoc = document.implementation.createHTMLDocument('SillyTavern');
+    pdoc.body.innerHTML = '<div id="sheld"><div id="chat">' + chat.map(function (m, i) {
+      return '<div class="mes" mesid="' + i + '" is_user="' + m.is_user + '" ch_name="' + esc(m.name) + '" swipeid="' + m.swipe_id + '"><div class="mes_block"><div class="ch_name"><span class="name_text">' + esc(m.name) + '</span></div><div class="mes_text">' + esc(m.message) + '</div></div></div>';
+    }).join('') + '</div><div id="form_sheld"><form id="send_form"><textarea id="send_textarea"></textarea><div id="send_but" class="fa-solid fa-paper-plane"></div><div id="mes_stop"></div></form></div></div>' +
+      '<div id="extensions_settings"></div><div id="extensions_settings2"></div><div id="left-nav-panel"></div><div id="right-nav-panel"></div><div id="movingDivs"></div><div id="bg1"></div>';
+    var sendArea = pdoc.getElementById('send_textarea');
+    var sendBtn = pdoc.getElementById('send_but');
+    var doSend = function () {
+      var v = String(sendArea.value || '');
+      if (v.trim()) send('sendText', { text: v });
+      sendArea.value = '';
+    };
+    sendBtn.addEventListener('click', doSend);
+    sendArea.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault && e.preventDefault(); doSend(); } });
+    var jq = function (sel, ctx) { return window.jQuery ? window.jQuery(sel, ctx || pdoc) : null; };
+    var fakeParent = {
+      document: pdoc,
+      SillyTavern: window.SillyTavern, TavernHelper: TH, Mvu: Mvu, toastr: toastr,
+      $: jq, jQuery: jq, _: window._, YAML: window.YAML,
+      postMessage: function (msg, origin, transfer) { try { realParent.postMessage(msg, '*', transfer); } catch (e) { /* */ } },
+      location: { href: 'http://127.0.0.1:8000/', origin: 'http://127.0.0.1:8000', host: '127.0.0.1:8000', hostname: '127.0.0.1', pathname: '/', search: '', hash: '', reload: function () {} },
+      addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () { return true; },
+      getComputedStyle: function (el) { try { return window.getComputedStyle(el); } catch (e) { return {}; } },
+      setTimeout: window.setTimeout.bind(window), clearTimeout: window.clearTimeout.bind(window),
+      setInterval: window.setInterval.bind(window), clearInterval: window.clearInterval.bind(window),
+      requestAnimationFrame: window.requestAnimationFrame.bind(window),
+      innerWidth: 1280, innerHeight: D.viewportHeight || 800, devicePixelRatio: window.devicePixelRatio || 1,
+      console: window.console, localStorage: window.localStorage, sessionStorage: window.sessionStorage,
+      navigator: window.navigator, frames: [], length: 0, name: 'SillyTavern',
+      eventSource: eventSource, event_types: tavern_events, getContext: ctx,
+    };
+    Object.keys(TH).forEach(function (k) { if (!(k in fakeParent)) fakeParent[k] = TH[k]; });
+    fakeParent.window = fakeParent; fakeParent.self = fakeParent; fakeParent.parent = fakeParent; fakeParent.top = fakeParent;
+    try { window.parent = fakeParent; } catch (e) { /* trình duyệt không cho thay */ }
+    var fakeFrameEl = pdoc.createElement('iframe');
+    fakeFrameEl.name = TH.getIframeName();
+    try { Object.defineProperty(window, 'frameElement', { value: fakeFrameEl, configurable: true }); } catch (e) { /* */ }
+  } catch (e) { /* bỏ qua: không giả lập được */ }
+
+  send('ready', { origin: String(location.origin) });
 
   // ------------------------------------------------------------------ chiều cao tự động
   var lastH = 0;

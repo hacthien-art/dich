@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "vendor": "node scripts/vendor.mjs",
-    "test": "node tests/translate.test.mjs && node tests/regex.test.mjs && node tests/run-all.mjs"
+    "test": "node tests/translate.test.mjs && node tests/analyze.test.mjs && node tests/regex.test.mjs && node tests/run-all.mjs"
   },
   "engines": {
     "node": ">=18"

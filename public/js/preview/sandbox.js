@@ -39,7 +39,15 @@ ${inlineScript(libs.yaml)}
   window.__reg = null;
   window.registerMvuSchema = function (s) { window.__reg = s; };
   window.__stub = { registerMvuSchema: window.registerMvuSchema };
-  var __send = function (r) { parent.postMessage({ __sb: ${JSON.stringify(id)}, result: r }, '*'); };
+  var __realParent = window.parent;
+  var __send = function (r) { __realParent.postMessage({ __sb: ${JSON.stringify(id)}, result: r }, '*'); };
+  // script schema đôi khi chạm tới window.parent (ST) -> đưa bản giả để không lỗi SecurityError
+  try {
+    var __pd = document.implementation.createHTMLDocument('SillyTavern');
+    var __fp = { document: __pd, $: function (s, c) { return window.jQuery(s, c || __pd); }, jQuery: function (s, c) { return window.jQuery(s, c || __pd); }, _: window._, z: window.z, postMessage: function () {}, addEventListener: function () {}, removeEventListener: function () {}, toastr: { success: function () {}, info: function () {}, warning: function () {}, error: function () {} } };
+    __fp.window = __fp; __fp.parent = __fp; __fp.top = __fp;
+    window.parent = __fp;
+  } catch (e) { /* */ }
   window.addEventListener('error', function (e) { __send({ ok: false, error: 'Lỗi script: ' + e.message }); });
   window.__DATA__ = ${safeJson(data)};
 <\/script>

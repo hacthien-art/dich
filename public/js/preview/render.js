@@ -77,18 +77,31 @@ export function inlineScript(code) {
   return '<script>' + String(code).replace(/<\/script/gi, '<\\/script') + '<\/script>';
 }
 
+/** Origin riêng cho iframe xem trước (cổng phụ của server); null nếu không có -> dùng sandbox srcdoc */
+export function frameOrigin() {
+  const port = Number(document.querySelector('meta[name="frame-port"]')?.content || 0);
+  return port ? `${location.protocol}//${location.hostname}:${port}` : null;
+}
+
+/** window.top không giả lập được trong iframe -> chuyển các truy cập top.* sang parent.* (đã giả lập kiểu ST) */
+function patchTop(doc) {
+  return doc
+    .replace(/\bwindow\.top\b/g, 'window.parent')
+    .replace(/(^|[^.\w$'"`-])top(?=\s*\.\s*(?:(?:document|SillyTavern|TavernHelper|Mvu|toastr|jQuery|postMessage|window|location|getContext|triggerSlash)\b|\$))/g, '$1parent');
+}
+
 /** Dựng tài liệu cho iframe giao diện (giống Tavern Helper): chèn môi trường giả lập vào <head>.
- *  libs: kết quả vendorSources(['jquery','lodash','yaml','env']) */
-export function buildFrameDoc(code, data, { viewportHeight = 800 } = {}, libs = {}) {
-  let doc = String(code).replace(/(\d+(?:\.\d+)?)vh\b/gi, 'calc(var(--TH-viewport-height) * $1 / 100)');
-  const head = `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+ *  origin: nạp thư viện từ cổng iframe; nếu không có thì libs (mã nguồn) được nhúng thẳng */
+export function buildFrameDoc(code, data, { viewportHeight = 800 } = {}, libs = {}, origin = null) {
+  let doc = patchTop(String(code)).replace(/(\d+(?:\.\d+)?)vh\b/gi, 'calc(var(--TH-viewport-height) * $1 / 100)');
+  const scripts = origin
+    ? ['vendor/jquery.min.js', 'vendor/lodash.min.js', 'vendor/yaml.iife.js', 'js/preview/th-env.js'].map((f) => `<script src="${origin}/${f}"><\/script>`).join('\n')
+    : [libs.jquery, libs.lodash, libs.yaml, libs.env].map((c) => inlineScript(c || '')).join('\n');
+  const head = `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="google" content="notranslate">
 <style>:root{--TH-viewport-height:${viewportHeight}px}html,body{margin:0;padding:0;}body{color:#d5d9e3;font-family:'Segoe UI',Arial,sans-serif;}</style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
 <script>window.__TH_DATA__=${safeJson(data)};<\/script>
-${inlineScript(libs.jquery || '')}
-${inlineScript(libs.lodash || '')}
-${inlineScript(libs.yaml || '')}
-${inlineScript(libs.env || '')}`;
+${scripts}`;
   if (/<head(\s[^>]*)?>/i.test(doc)) doc = doc.replace(/<head(\s[^>]*)?>/i, (m) => m + head);
   else if (/<html(\s[^>]*)?>/i.test(doc)) doc = doc.replace(/<html(\s[^>]*)?>/i, (m) => m + '<head>' + head + '</head>');
   else doc = '<!DOCTYPE html><html><head>' + head + '</head><body>' + doc + '</body></html>';
@@ -96,6 +109,37 @@ ${inlineScript(libs.env || '')}`;
 }
 
 export const FRAME_SANDBOX = 'allow-scripts allow-modals allow-popups allow-popups-to-escape-sandbox allow-forms allow-downloads';
+// iframe tải từ cổng riêng: giữ origin thật của nó (khác app) để có localStorage/IndexedDB; không được điều hướng trang app
+export const FRAME_SANDBOX_ORIGIN = 'allow-scripts allow-same-origin allow-modals allow-popups allow-popups-to-escape-sandbox allow-forms allow-downloads allow-pointer-lock';
+
+const appToken = () => document.querySelector('meta[name="app-token"]')?.content || '';
+
+// cổng iframe riêng bị chặn (tường lửa / tiện ích / chính sách trình duyệt) -> dùng sandbox srcdoc cho các lần sau
+let originBroken = false;
+export function markFrameOriginBroken() { originBroken = true; }
+export function frameOriginUsable() { return !!frameOrigin() && !originBroken; }
+
+/** Gắn tài liệu vào iframe: ưu tiên origin riêng (cổng phụ), nếu lỗi thì dùng sandbox srcdoc. Trả về 'origin' | 'srcdoc' */
+export async function mountFrame(iframe, code, data, opts = {}) {
+  const origin = frameOrigin();
+  if (origin && !originBroken && !opts.forceInline) {
+    try {
+      const doc = buildFrameDoc(code, data, opts, {}, origin);
+      const r = await fetch('/api/frame', { method: 'POST', headers: { 'X-App-Token': appToken(), 'Content-Type': 'text/html; charset=utf-8' }, body: doc });
+      const j = await r.json();
+      if (r.ok && j.id && j.port) {
+        iframe.setAttribute('sandbox', FRAME_SANDBOX_ORIGIN);
+        iframe.src = `${origin}/f/${j.id}`;
+        return 'origin';
+      }
+    } catch { /* dùng dự phòng */ }
+  }
+  const libs = await vendorSources(['jquery', 'lodash', 'yaml', 'env']);
+  iframe.removeAttribute('src');
+  iframe.setAttribute('sandbox', FRAME_SANDBOX);
+  iframe.srcdoc = buildFrameDoc(code, data, opts, libs, null);
+  return 'srcdoc';
+}
 
 /** CSS nền cho nội dung tin nhắn trong shadow DOM (giống giao diện ST tối) */
 export const MESSAGE_CSS = `

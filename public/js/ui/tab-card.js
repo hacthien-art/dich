@@ -2,7 +2,7 @@
 import { h, clear, toast, confirmBox, add } from './dom.js';
 import { GROUPS } from '../core/card.js';
 import { PH_RE } from '../core/analyze.js';
-import { validateSegment } from '../core/translate.js';
+import { validateSegment, allowedHanSet } from '../core/translate.js';
 import { formatBytes } from '../core/util.js';
 
 const KIND_LABEL = { name: 'tên', auto: 'văn bản/HTML', initvar: 'InitVar (biến khởi tạo)', code: 'mã script', schema: 'schema Zod', regexFind: 'find regex', keys: 'từ khóa', comment: 'tên mục', list: 'danh sách' };
@@ -47,7 +47,7 @@ export function create(app, el) {
     todoChk.addEventListener('change', () => { onlyTodo = todoChk.checked; renderGroups(); });
     treeEl.append(
       h('div', { style: { padding: '4px 6px 8px' } }, search,
-        h('label', { class: 'check small' }, todoChk, 'Chỉ hiện mục chưa dịch xong'),
+        h('label', { class: 'check small' }, todoChk, 'Chỉ hiện mục chưa dịch xong / có lỗi'),
         h('div', { class: 'row', style: { gap: '6px', fontSize: '11px' } },
           ...['done', 'partial', 'todo', 'sync', 'manual'].map((s) => h('span', { class: 'row', style: { gap: '4px' } }, h('span', { class: 'dot ' + s }), STATE_LABEL[s])))),
     );
@@ -60,7 +60,7 @@ export function create(app, el) {
         if (!items.length) continue;
         const shown = items.filter((it) => {
           if (filter && !it.label.toLowerCase().includes(filter)) return false;
-          if (onlyTodo) { const st = p.status(it.id).state; return st === 'todo' || st === 'partial'; }
+          if (onlyTodo) { const st = p.status(it.id).state; return st === 'todo' || st === 'partial' || st === 'warn'; }
           return true;
         });
         const sts = items.map((it) => p.status(it.id));
@@ -124,6 +124,7 @@ export function create(app, el) {
             st.remainingChars ? h('span', { class: 'pill' }, `còn ${formatBytes(st.remainingChars).replace(' B', '')} ký tự`) : null),
           h('div', { class: 'row', style: { marginTop: '10px' } },
             h('button', { class: 'btn primary', disabled: !!app.running, onclick: () => app.translateAll() }, '▶ Dịch toàn bộ'),
+            h('button', { class: 'btn', disabled: !!app.running || !p.problemSegments().length, onclick: () => app.translateAll(null, { problems: true }) }, `🔁 Dịch chỗ thiếu/lỗi (${p.problemSegments().length})`),
             h('button', { class: 'btn', onclick: () => app.showTab('vars') }, '🧬 Xem bảng biến'),
             h('button', { class: 'btn', onclick: () => app.showTab('preview') }, '🧩 Xem trước regex/HTML')),
         )),
@@ -168,6 +169,7 @@ export function create(app, el) {
       ),
       h('div', { class: 'row', style: { marginBottom: '10px' } },
         h('button', { class: 'btn primary small', disabled: !keys.length || !!app.running, onclick: () => app.translateAll([it.id]) }, '▶ Dịch mục này'),
+        h('button', { class: 'btn small', disabled: !keys.some((k) => !p.tm.has(k) || p.data.warnings[k]) || !!app.running, title: 'Chỉ dịch lại các đoạn chưa dịch hoặc bị lỗi/còn sót chữ Hán của mục này', onclick: () => app.translateAll([it.id], { problems: true }) }, '🔁 Dịch đoạn lỗi'),
         h('button', { class: 'btn small', disabled: !keys.length || !!app.running, onclick: async () => { if (await confirmBox('Dịch lại toàn bộ đoạn của mục này (ghi đè bản dịch hiện có)?', 'Dịch lại')) app.translateAll([it.id], { force: true }); } }, '↻ Dịch lại'),
         h('button', { class: 'btn small', disabled: !keys.some((k) => p.tm.has(k)), onclick: async () => { if (await confirmBox('Xóa bản dịch các đoạn của mục này?', 'Xóa', 'danger')) { p.clearTranslations(keys); app.saveProject(); renderEditor(); liveUpdate(); } } }, '✕ Xóa bản dịch'),
         manual ? h('button', { class: 'btn small', onclick: () => { p.setOverride(it.id, undefined); app.saveProject(); renderEditor(); liveUpdate(); } }, '⟲ Bỏ chỉnh tay') : null,
@@ -194,7 +196,7 @@ export function create(app, el) {
           ta.addEventListener('change', () => {
             const v = ta.value;
             if (!v.trim()) { p.clearTranslations([k]); app.saveProject(); renderEditor(); liveUpdate(); return; }
-            const val = validateSegment(seg, v);
+            const val = validateSegment(seg, v, allowedHanSet(p.data.dict, app.ts(), p.data.glossary));
             if (!val.ok && !val.soft) { toast('Không lưu: ' + val.reason + '. Bản dịch phải giữ đủ các ⟦n⟧.', 'err', 5000); return; }
             p.setTranslation(k, val.out ?? v, val.ok ? val.warn : val.reason);
             app.saveProject();

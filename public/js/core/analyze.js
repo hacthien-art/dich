@@ -235,6 +235,9 @@ class Analyzer {
     if (o.entities) {
       const re = /&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);/gi;
       while ((m = re.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
+      // "<chữ" lạc trong văn bản HTML (thẻ hỏng) -> giữ nguyên, tránh bị escape thành &lt;
+      const re2 = /<[A-Za-z\/!?][^<>\s]*/g;
+      while ((m = re2.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
     }
     if (o.jsEscapes) {
       const re = /\\(?:u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g;
@@ -367,6 +370,19 @@ class Analyzer {
       lexSrc = local; base = start; lexStart = 0; lexEnd = local.length;
     }
     const toks = lexHtml(lexSrc, lexStart, lexEnd).map((t) => shiftTok(t, base));
+    // mảnh HTML trong chuỗi JS bắt đầu giữa thẻ: '" title="x">chữ' -> phần tới '>' là đuôi thẻ, giữ nguyên
+    if ((o.jsEscapes || o.masks) && toks[0]?.type === 'text') {
+      const t0 = toks[0];
+      const txt = src.slice(t0.start, t0.end);
+      const gt = txt.indexOf('>');
+      if (gt >= 0) {
+        const pre = txt.slice(0, gt);
+        if (!pre.includes('<') && (/["']\s*\/?$/.test(pre) || /^\s*\/?$/.test(pre))) {
+          const rest = gt + 1 < txt.length ? [{ type: 'text', start: t0.start + gt + 1, end: t0.end }] : [];
+          toks.splice(0, 1, { type: 'partial', start: t0.start, end: t0.start + gt + 1 }, ...rest);
+        }
+      }
+    }
     const used = new Set();
     let run = [];
     const flush = () => { this.htmlRun(parent, run, masks, used, outerEsc, o); run = []; };

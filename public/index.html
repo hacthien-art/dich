@@ -1,9 +1,11 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="vi" translate="no" class="notranslate">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="google" content="notranslate">
   <meta name="app-token" content="__APP_TOKEN__">
+  <meta name="frame-port" content="__FRAME_PORT__">
   <title>Tavern Card Translator — Dịch card ST Trung → Việt</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%237aa2f7'/%3E%3Ctext x='32' y='43' font-size='30' text-anchor='middle' fill='%23101218' font-family='Arial' font-weight='bold'%3EVI%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/css/app.css">
@@ -21,6 +23,7 @@
     <div class="top-actions">
       <button id="btnImport" class="btn">📥 Nhập card</button>
       <button id="btnTranslateAll" class="btn primary" disabled>▶ Dịch toàn bộ</button>
+      <button id="btnRetry" class="btn" disabled title="Dịch lại các đoạn chưa dịch hoặc bị lỗi / còn sót chữ Hán">🔁 Dịch chỗ thiếu/lỗi</button>
       <button id="btnStop" class="btn danger" hidden>■ Dừng</button>
       <div class="dropdown">
         <button id="btnExport" class="btn success" disabled>💾 Xuất card ▾</button>
