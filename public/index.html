@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="app-token" content="__APP_TOKEN__">
+  <title>Tavern Card Translator — Dịch card ST Trung → Việt</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%237aa2f7'/%3E%3Ctext x='32' y='43' font-size='30' text-anchor='middle' fill='%23101218' font-family='Arial' font-weight='bold'%3EVI%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/app.css">
+  <script src="/vendor/showdown.min.js"></script>
+  <script src="/vendor/purify.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">中→VI</span><span class="brand-name">Tavern Card Translator</span></div>
+    <div class="project-box">
+      <span class="muted">Dự án:</span>
+      <span id="projectName" class="project-name">(chưa mở card)</span>
+      <button id="btnProjects" class="btn small ghost" title="Mở dự án đã lưu">📂 Dự án</button>
+    </div>
+    <div class="top-actions">
+      <button id="btnImport" class="btn">📥 Nhập card</button>
+      <button id="btnTranslateAll" class="btn primary" disabled>▶ Dịch toàn bộ</button>
+      <button id="btnStop" class="btn danger" hidden>■ Dừng</button>
+      <div class="dropdown">
+        <button id="btnExport" class="btn success" disabled>💾 Xuất card ▾</button>
+        <div class="dropdown-menu" id="exportMenu">
+          <button data-export="png">Xuất PNG (card có ảnh)</button>
+          <button data-export="json">Xuất JSON</button>
+        </div>
+      </div>
+    </div>
+    <div class="progress-wrap" id="progressWrap" hidden>
+      <div class="progress"><div class="bar" id="progressBar"></div></div>
+      <span id="progressText" class="muted small"></span>
+    </div>
+  </header>
+
+  <nav class="sidebar" id="sidebar">
+    <button class="tab active" data-tab="connect"><span>🔌</span>Kết nối API</button>
+    <button class="tab" data-tab="preset"><span>🎛️</span>Preset &amp; Tham số</button>
+    <button class="tab" data-tab="card"><span>📇</span>Card &amp; Bản dịch</button>
+    <button class="tab" data-tab="vars"><span>🧬</span>Biến &amp; Đồng bộ</button>
+    <button class="tab" data-tab="preview"><span>🧩</span>Regex &amp; Xem trước</button>
+    <button class="tab" data-tab="settings"><span>⚙️</span>Cài đặt dịch</button>
+    <button class="tab" data-tab="log"><span>📜</span>Nhật ký <em id="logBadge" class="badge" hidden>0</em></button>
+    <div class="sidebar-foot muted small">Chạy cục bộ · dữ liệu lưu trong thư mục <code>data/</code></div>
+  </nav>
+
+  <main id="main">
+    <section class="panel active" id="tab-connect"></section>
+    <section class="panel" id="tab-preset"></section>
+    <section class="panel" id="tab-card"></section>
+    <section class="panel" id="tab-vars"></section>
+    <section class="panel" id="tab-preview"></section>
+    <section class="panel" id="tab-settings"></section>
+    <section class="panel" id="tab-log"></section>
+  </main>
+
+  <input type="file" id="fileCard" accept=".png,.json,image/png,application/json" hidden>
+  <div id="toasts"></div>
+  <div id="modalRoot"></div>
+  <div id="dropOverlay" hidden><div>Thả file card (.png / .json) hoặc preset (.json) vào đây</div></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

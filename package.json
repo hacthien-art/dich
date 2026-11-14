@@ -1,0 +1,25 @@
+{
+  "name": "tavern-card-translator",
+  "version": "1.0.0",
+  "description": "Dịch card SillyTavern (MVU / Zod) từ tiếng Trung sang tiếng Việt, đồng bộ biến, xem trước regex HTML",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "vendor": "node scripts/vendor.mjs",
+    "test": "node tests/translate.test.mjs && node tests/regex.test.mjs && node tests/run-all.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "dompurify": "^3.4.17",
+    "esbuild": "^0.28.2",
+    "jquery": "^3.7.1",
+    "js-yaml": "^5.5.0",
+    "lodash": "^4.18.1",
+    "showdown": "^2.1.0",
+    "zod": "^4.6.7"
+  }
+}

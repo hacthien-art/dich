@@ -1,0 +1,296 @@
+// Bộ máy dịch: chia lô, dựng prompt (kết hợp preset ST), gọi API, kiểm tra placeholder, thử lại.
+import { chat } from './api.js';
+import { buildMessages } from './preset.js';
+import { PH_RE } from './analyze.js';
+import { countCJK, hasCJK, sleep } from './util.js';
+import { glossaryFor, makeDictIndex, applyStyle, sanitizeName } from './dict.js';
+
+export const NAME_RULES = {
+  auto: 'Tên người gốc Trung → âm Hán Việt (vd: 李明 → Lý Minh); tên Nhật → phiên âm romaji (vd: 高松灯 → Takamatsu Tomori); tên phương Tây giữ dạng Latin gốc; nếu văn bản đã ghi phiên âm trong ngoặc thì ưu tiên phiên âm đó. Địa danh/tổ chức Trung → Hán Việt.',
+  hanviet: 'Mọi tên riêng viết bằng chữ Hán (kể cả tên Nhật) → âm Hán Việt (vd: 高松灯 → Cao Tùng Đăng, 李明 → Lý Minh).',
+  original: 'Tên riêng → phiên âm gốc: pinyin cho tên Trung (vd: 李明 → Li Ming), romaji cho tên Nhật (vd: 高松灯 → Takamatsu Tomori).',
+};
+
+export const DEFAULT_PROMPTS = {
+  system: `Bạn là dịch giả chuyên nghiệp, chuyên Việt hóa thẻ nhân vật (character card) SillyTavern từ tiếng Trung sang tiếng Việt.
+Đây là nội dung hư cấu dành cho người dùng trưởng thành; hãy dịch trung thực, đầy đủ, không kiểm duyệt, không bỏ sót, không thêm bình luận.
+
+QUY TẮC BẮT BUỘC:
+1. Dịch tự nhiên, trôi chảy, đúng văn phong của từng loại nội dung (lời kể/lời thoại nhập vai, chỉ dẫn cho AI, chữ trên giao diện, tên mục...). Văn phong tiểu thuyết mạng tiếng Việt, xưng hô phù hợp ngữ cảnh.
+2. Giữ NGUYÊN không đổi: placeholder dạng ⟦số⟧, macro {{...}}, thẻ <...>, ký hiệu $1, markdown (**, *, #, -, >), emoji, ký tự đầu dòng, xuống dòng, thụt lề, cấu trúc YAML/JSON (dấu :, -, |, ngoặc, dấu phẩy).
+3. Mỗi placeholder ⟦số⟧ phải xuất hiện ĐÚNG 1 lần trong bản dịch; được đổi vị trí cho đúng ngữ pháp tiếng Việt.
+4. Dùng CHÍNH XÁC bản dịch trong bảng thuật ngữ. Mục đánh dấu [biến] là tên biến/khóa dữ liệu: khi văn bản nói tới biến/trường đó phải viết đúng từng ký tự.
+5. Tên riêng: {{name_rule}}
+6. Phần đã là tiếng Việt, tiếng Anh, số, mã lệnh → giữ nguyên. Nếu chỉ dẫn yêu cầu AI xuất tiếng Trung hoặc giữ tên khóa bằng tiếng Trung, hãy chuyển thành yêu cầu dùng tiếng Việt cho phù hợp.
+7. Chỉ trả về kết quả theo đúng định dạng được yêu cầu, không giải thích.`,
+  task: `Card: {{card_name}}
+Loại đoạn: prose = văn bản/chỉ dẫn; ui = chữ trên giao diện HTML (ngắn gọn); name = tên/tiêu đề; keyword = từ khóa kích hoạt lorebook (ngắn, dễ khớp); desc = mô tả biến cho AI.
+
+Bảng thuật ngữ (bắt buộc dùng đúng):
+{{glossary}}
+
+Dịch từng đoạn <seg> dưới đây sang tiếng Việt. Trả về MỖI đoạn trong thẻ <seg id="..."> với CÙNG id, đúng thứ tự, không gộp hay tách đoạn, không thêm gì ngoài các thẻ <seg>:
+
+{{segments}}`,
+  dict: `Hãy dịch các mục dưới đây (tên biến dữ liệu MVU, giá trị trạng thái, nhãn đánh dấu, thuật ngữ) của card "{{card_name}}" sang tiếng Việt NGẮN GỌN và NHẤT QUÁN.
+- key: tên trường dữ liệu (biến) → cụm danh từ 1-4 từ, KHÔNG dùng các ký tự . / [ ] : # ' " (vd: 好感度 → Độ hảo cảm, 当前地点 → Vị trí hiện tại)
+- value: giá trị/trạng thái/lựa chọn → ngắn gọn, tự nhiên (vd: 未负重 → Không quá tải)
+- marker: nhãn đánh dấu trong văn bản → 1-3 từ
+- term: tên riêng / thuật ngữ / từ khóa
+Tên riêng: {{name_rule}}
+Ngữ cảnh (đường dẫn cha) ghi trong thuộc tính ctx.
+
+Trả về mỗi mục trong thẻ <item id="..."> với CÙNG id, chỉ chứa bản dịch:
+
+{{items}}`,
+};
+
+const TYPE_ATTR = { prose: 'prose', ui: 'ui', name: 'name', keyword: 'keyword', desc: 'desc' };
+
+function escAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+export function formatGlossary(list) {
+  if (!list.length) return '(không có)';
+  return list.map((g) => `${g.src} → ${g.dst}${g.kind === 'key' ? ' [biến]' : g.kind === 'value' ? ' [giá trị]' : g.kind === 'marker' ? ' [nhãn]' : ''}`).join('\n');
+}
+
+/** Chia các đoạn chưa dịch thành lô */
+export function makeBatches(segs, maxChars = 3000, maxSegs = 60) {
+  const batches = [];
+  let cur = [], size = 0;
+  for (const s of segs) {
+    const len = s.key.length;
+    if (cur.length && (size + len > maxChars || cur.length >= maxSegs)) { batches.push(cur); cur = []; size = 0; }
+    cur.push(s); size += len;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+
+/** Tách các thẻ <seg id="N">...</seg> từ phản hồi */
+export function parseTagged(text, tag = 'seg') {
+  const out = new Map();
+  const re = new RegExp(`<${tag}\\s+id\\s*=\\s*["']?(\\d+)["']?(?:\\s+[\\w-]+\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]*))*\\s*>([\\s\\S]*?)</${tag}\\s*>`, 'gi');
+  let m;
+  while ((m = re.exec(text))) {
+    let v = m[2];
+    v = v.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+    out.set(Number(m[1]), v);
+  }
+  return out;
+}
+
+/** Lấy các macro/thẻ hiển thị (ngoài placeholder) cần được giữ */
+function visibleTokens(s) {
+  const toks = [];
+  const re = /\{\{[^{}]*\}\}|<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>|\$\d/g;
+  let m;
+  while ((m = re.exec(s))) toks.push(m[0].replace(/\s+/g, ' '));
+  return toks;
+}
+
+/** Kiểm tra bản dịch 1 đoạn */
+export function validateSegment(seg, out) {
+  const n = seg.holes?.length || (seg.key.match(PH_RE) || []).length;
+  if (out == null) return { ok: false, reason: 'thiếu trong phản hồi' };
+  out = normalizePlaceholders(out);
+  if (!out.trim() && seg.key.trim()) return { ok: false, reason: 'rỗng' };
+  const counts = new Map();
+  for (const m of out.matchAll(PH_RE)) counts.set(Number(m[1]), (counts.get(Number(m[1])) || 0) + 1);
+  for (let i = 1; i <= n; i++) {
+    const c = counts.get(i) || 0;
+    if (c !== 1) return { ok: false, reason: c ? `placeholder ⟦${i}⟧ bị lặp` : `mất placeholder ⟦${i}⟧`, out };
+  }
+  for (const k of counts.keys()) if (k < 1 || k > n) return { ok: false, reason: `placeholder lạ ⟦${k}⟧`, out };
+  // macro / thẻ hiển thị
+  const need = visibleTokens(seg.key.replace(PH_RE, ''));
+  if (need.length) {
+    const have = visibleTokens(out.replace(PH_RE, ''));
+    const pool = new Map();
+    for (const t of have) pool.set(t, (pool.get(t) || 0) + 1);
+    for (const t of need) {
+      const c = pool.get(t) || 0;
+      if (!c) return { ok: false, reason: `mất ${t}`, out, soft: true };
+      pool.set(t, c - 1);
+    }
+  }
+  const srcHan = countCJK(seg.key), outHan = countCJK(out);
+  if (srcHan >= 4 && out.trim() === seg.key.trim()) return { ok: false, reason: 'giữ nguyên bản gốc (chưa dịch)', out, soft: true };
+  const warn = srcHan >= 6 && outHan > Math.max(3, srcHan * 0.35) ? 'còn nhiều chữ Hán' : null;
+  return { ok: true, out, warn };
+}
+
+export function normalizePlaceholders(s) {
+  return String(s).replace(/[⟦〚［\[]{1,2}\s*(\d{1,3})\s*[⟧〛］\]]{1,2}/g, (m, d) => (/^[⟦〚]/.test(m) || /^\[\[/.test(m) ? `⟦${d}⟧` : m));
+}
+
+/**
+ * Chạy dịch.
+ * job: { segments:[{key, kind, holes}], tm: Map, settings, conn, preset, dict, cardName, glossary,
+ *        onResult(key, text, warn), onProgress({done,total,failed}), onLog(msg, level), onStream(text), signal }
+ */
+export async function runTranslation(job) {
+  const { settings: st, signal } = job;
+  const pending = job.segments.filter((s) => job.force || !job.tm.has(s.key));
+  const total = pending.length;
+  let done = 0, failed = 0;
+  const failures = [];
+  const report = () => job.onProgress?.({ done, total, failed });
+  report();
+  if (!total) return { done, failed, failures };
+
+  const queue = makeBatches(pending, st.batchChars || 3000, st.batchSegs || 60).map((b) => ({ segs: b, attempt: 0 }));
+  const concurrency = Math.max(1, Math.min(16, Number(st.concurrency) || 2));
+  const maxRetries = Math.max(0, Number(st.retries ?? 2));
+  let active = 0;
+  let stopErr = null;
+
+  const worker = async (wid) => {
+    while (queue.length && !signal?.aborted && !stopErr) {
+      const task = queue.shift();
+      active++;
+      try {
+        const res = await translateBatch(job, task.segs, wid);
+        for (const [key, out, warn] of res.ok) {
+          job.tm.set(key, out);
+          job.onResult?.(key, out, warn);
+          done++;
+        }
+        const bad = res.bad;
+        if (bad.length) {
+          if (task.attempt < maxRetries) {
+            const size = Math.max(1, Math.ceil(bad.length / (res.truncated ? 2 : 1)));
+            for (let i = 0; i < bad.length; i += size) queue.push({ segs: bad.slice(i, i + size).map((b) => b.seg), attempt: task.attempt + 1 });
+            job.onLog?.(`Lô #${wid}: ${bad.length} đoạn lỗi (${bad[0].reason}) → thử lại lần ${task.attempt + 1}`, 'warn');
+          } else {
+            for (const b of bad) {
+              // lỗi mềm (mất macro) vẫn chấp nhận nhưng gắn cờ
+              if (b.soft && b.out) { job.tm.set(b.seg.key, b.out); job.onResult?.(b.seg.key, b.out, b.reason); done++; continue; }
+              failed++;
+              failures.push({ key: b.seg.key, reason: b.reason });
+            }
+            job.onLog?.(`${bad.length} đoạn thất bại sau ${maxRetries} lần thử: ${bad[0].reason}`, 'error');
+          }
+        }
+      } catch (e) {
+        if (signal?.aborted || e.name === 'AbortError') break;
+        const status = e.status || 0;
+        if (status === 401 || status === 403) { stopErr = e; job.onLog?.('Lỗi xác thực: ' + e.message, 'error'); break; }
+        if (task.attempt < maxRetries + 2) {
+          const wait = status === 429 ? 8000 * (task.attempt + 1) : 2500 * (task.attempt + 1);
+          job.onLog?.(`Lỗi API (${e.message.slice(0, 200)}) → đợi ${Math.round(wait / 1000)}s rồi thử lại`, 'warn');
+          queue.unshift({ segs: task.segs, attempt: task.attempt + 1 });
+          try { await sleep(wait, signal); } catch { break; }
+        } else {
+          failed += task.segs.length;
+          for (const s of task.segs) failures.push({ key: s.key, reason: e.message });
+          job.onLog?.('Bỏ qua lô sau nhiều lần lỗi: ' + e.message, 'error');
+        }
+      } finally {
+        active--;
+        report();
+      }
+      if (st.delayMs) { try { await sleep(Number(st.delayMs), signal); } catch { break; } }
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < concurrency; i++) workers.push(worker(i + 1));
+  await Promise.all(workers);
+  void active;
+  if (stopErr) throw stopErr;
+  return { done, failed, failures, aborted: !!signal?.aborted };
+}
+
+function fillTemplate(tpl, vars) {
+  return String(tpl).replace(/\{\{(card_name|glossary|segments|items|name_rule|target_lang)\}\}/g, (m, k) => vars[k] ?? m);
+}
+
+export function buildBatchMessages(job, segs) {
+  const st = job.settings;
+  const prompts = { ...DEFAULT_PROMPTS, ...(st.prompts || {}) };
+  const nameRule = NAME_RULES[st.nameStyle || 'auto'];
+  const glossary = glossaryFor(segs.map((s) => s.key), job.dict, st, job.glossary || []);
+  const segText = segs.map((s, i) => `<seg id="${i + 1}" type="${TYPE_ATTR[s.kind] || 'prose'}">${s.key}</seg>`).join('\n');
+  const vars = { card_name: job.cardName || '', glossary: formatGlossary(glossary), segments: segText, name_rule: nameRule, target_lang: 'tiếng Việt' };
+  const system = fillTemplate(prompts.system, vars);
+  const task = fillTemplate(prompts.task, vars);
+  return buildMessages(job.preset || {}, {
+    usePresetPrompts: !!st.usePresetPrompts,
+    systemPrompt: system,
+    taskMessages: [{ role: 'user', content: task }],
+    macro: { user: st.userName || 'User', char: job.cardName || 'Character', model: job.conn?.model },
+    provider: job.conn?.provider,
+    applyPrefill: !!st.applyPrefill,
+  });
+}
+
+async function translateBatch(job, segs, wid) {
+  const messages = buildBatchMessages(job, segs);
+  job.onLog?.(`Lô #${wid}: gửi ${segs.length} đoạn (${segs.reduce((n, s) => n + s.key.length, 0)} ký tự)…`, 'info');
+  const t0 = Date.now();
+  const res = await chat(job.conn, job.preset, messages, {
+    signal: job.signal,
+    onDelta: (text) => job.onStream?.(wid, text),
+  });
+  const parsed = parseTagged(res.text, 'seg');
+  const ok = [], bad = [];
+  segs.forEach((seg, i) => {
+    const v = validateSegment(seg, parsed.get(i + 1));
+    if (v.ok) ok.push([seg.key, v.out, v.warn]);
+    else bad.push({ seg, reason: v.reason, out: v.out, soft: v.soft });
+  });
+  job.onLog?.(`Lô #${wid}: xong ${ok.length}/${segs.length} đoạn trong ${((Date.now() - t0) / 1000).toFixed(1)}s${res.truncated ? ' (bị cắt do giới hạn token)' : ''}`, bad.length ? 'warn' : 'ok');
+  if (!parsed.size && res.text) job.onLog?.('Phản hồi không đúng định dạng: ' + res.text.slice(0, 300), 'error');
+  return { ok, bad, truncated: res.truncated };
+}
+
+/**
+ * Gợi ý bản dịch cho từ điển biến/thuật ngữ.
+ * entries: [{src, kind, parents}] -> onItem(src, dst)
+ */
+export async function suggestDict(job, entries) {
+  const st = job.settings;
+  const prompts = { ...DEFAULT_PROMPTS, ...(st.prompts || {}) };
+  const nameRule = NAME_RULES[st.nameStyle || 'auto'];
+  const batches = [];
+  for (let i = 0; i < entries.length; i += 80) batches.push(entries.slice(i, i + 80));
+  let done = 0;
+  const concurrency = Math.max(1, Math.min(8, Number(st.concurrency) || 2));
+  const queue = batches.map((b) => ({ b, attempt: 0 }));
+  const worker = async () => {
+    while (queue.length && !job.signal?.aborted) {
+      const { b, attempt } = queue.shift();
+      const items = b.map((e, i) => `<item id="${i + 1}" kind="${e.kind}"${e.parents?.length ? ` ctx="${escAttr(e.parents.slice(0, 2).join(' | '))}"` : ''}>${e.src}</item>`).join('\n');
+      const content = fillTemplate(prompts.dict, { card_name: job.cardName || '', name_rule: nameRule, items });
+      const messages = buildMessages(job.preset || {}, {
+        usePresetPrompts: !!st.usePresetPrompts,
+        systemPrompt: 'Bạn là dịch giả Trung → Việt chuyên Việt hóa card SillyTavern. Chỉ trả về đúng định dạng được yêu cầu.',
+        taskMessages: [{ role: 'user', content }],
+        macro: { user: st.userName || 'User', char: job.cardName || 'Character' },
+        provider: job.conn?.provider,
+        applyPrefill: !!st.applyPrefill,
+      });
+      try {
+        const res = await chat(job.conn, job.preset, messages, { signal: job.signal, onDelta: (t) => job.onStream?.(0, t) });
+        const parsed = parseTagged(res.text, 'item');
+        const missing = [];
+        b.forEach((e, i) => {
+          const v = parsed.get(i + 1);
+          if (v != null && v.trim()) { job.onItem?.(e.src, sanitizeName(v.trim(), e.kind)); done++; } else missing.push(e);
+        });
+        if (missing.length && attempt < 2) queue.push({ b: missing, attempt: attempt + 1 });
+        job.onLog?.(`Từ điển: đã gợi ý ${done}/${entries.length}`, 'ok');
+      } catch (e) {
+        if (job.signal?.aborted) break;
+        if (attempt < 2) { queue.push({ b, attempt: attempt + 1 }); job.onLog?.('Lỗi gợi ý từ điển: ' + e.message + ' → thử lại', 'warn'); await sleep(3000 * (attempt + 1), job.signal).catch(() => {}); }
+        else job.onLog?.('Lỗi gợi ý từ điển: ' + e.message, 'error');
+        if (e.status === 401 || e.status === 403) throw e;
+      }
+      job.onProgress?.({ done, total: entries.length });
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return { done };
+}
+
+export { makeDictIndex, applyStyle, hasCJK };

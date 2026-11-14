@@ -1,0 +1,19 @@
+# Dữ liệu cục bộ của app: chứa mật khẩu proxy / API key, preset, dự án dịch — KHÔNG đưa lên repo
+data/
+
+# Thư viện npm (chỉ cần khi chạy `npm run vendor` / `npm test`)
+node_modules/
+
+# Card mẫu, tài nguyên cá nhân đặt ở thư mục gốc (dùng cho kiểm thử) — không công khai
+/*.json
+!/package.json
+!/package-lock.json
+/*.png
+/*.gz
+/*.zip
+
+# Công cụ / hệ điều hành
+.claude/
+*.log
+Thumbs.db
+.DS_Store
