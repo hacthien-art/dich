@@ -12,6 +12,7 @@ import { makeCard, listItems } from '../public/js/core/card.js';
 import { scanCard, mergeScan, makeDictIndex } from '../public/js/core/dict.js';
 import { analyzeItem, PH_RE } from '../public/js/core/analyze.js';
 import { lexHtml } from '../public/js/core/lexer.js';
+import { regexFromString } from '../public/js/core/stregex.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cards = fs.readdirSync(ROOT).filter((f) => f.endsWith('.json') && !['package.json', 'package-lock.json'].includes(f));
@@ -128,9 +129,17 @@ for (const file of cards) {
     const fIndex = makeDictIndex(fakeDict, settings);
     const tm = new Map();
     for (const a of analyses.values()) for (const s of a.segments) tm.set(s.key, pass.nasty(s.key));
-    const env = { tm, dict: fIndex, entryName: (s) => 'Mục ' + s.length, keysMode: 'append' };
+    const env = { tm, dict: fIndex, entryName: (s) => 'Mục ' + s.length, keysMode: 'append', widenRegex: true };
     const outputs = new Map();
     for (const it of items) outputs.set(it.id, analyses.get(it.id).render(env));
+
+    // a0) find regex sau dịch (đổi nhãn + nới dấu câu toàn độ rộng) vẫn là regex hợp lệ
+    let rxBad = 0;
+    for (const it of items) {
+      if (it.kind !== 'regexFind' || !regexFromString(it.text)) continue;
+      if (!regexFromString(outputs.get(it.id))) { rxBad++; fail(`${it.label}: find regex sau dịch không hợp lệ: ${outputs.get(it.id)}`); }
+    }
+    if (!rxBad && pass === PASSES[0]) ok('mọi find regex sau dịch vẫn hợp lệ');
 
     // a) script trong HTML vẫn biên dịch được (nếu bản gốc biên dịch được)
     let jsChecked = 0, jsBad = 0;

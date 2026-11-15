@@ -215,38 +215,10 @@ export function lexHtml(src, start = 0, end = src.length) {
     const name = src.slice(nameStart, j);
     const lower = name.toLowerCase();
     // thuộc tính
-    const attrs = [];
-    let k = j, selfClose = false, closed = false;
-    while (k < end) {
-      while (k < end && /\s/.test(src[k])) k++;
-      if (src[k] === '>') { closed = true; k++; break; }
-      if (src[k] === '/' && src[k + 1] === '>') { selfClose = true; closed = true; k += 2; break; }
-      if (src[k] === '/') { k++; continue; }
-      if (src[k] === '<') break; // thẻ lỗi
-      const nS = k;
-      while (k < end && !/[\s=>]/.test(src[k]) && !(src[k] === '/' && src[k + 1] === '>')) k++;
-      const nE = k;
-      if (nE === nS) { k++; continue; }
-      while (k < end && /\s/.test(src[k])) k++;
-      if (src[k] === '=') {
-        k++;
-        while (k < end && /\s/.test(src[k])) k++;
-        const q = src[k];
-        if (q === '"' || q === "'") {
-          const vS = k + 1;
-          let vE = src.indexOf(q, vS);
-          if (vE < 0 || vE > end) vE = end;
-          attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: vS, vEnd: vE, quote: q });
-          k = vE + 1;
-        } else {
-          const vS = k;
-          while (k < end && !/[\s>]/.test(src[k])) k++;
-          attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: vS, vEnd: k, quote: '' });
-        }
-      } else {
-        attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: -1, vEnd: -1, quote: '' });
-      }
-    }
+    const tagAttrs = lexAttrs(src, j, end);
+    if (tagAttrs.closed) recoverBrokenQuotes(src, tagAttrs, end);
+    const { attrs, selfClose, closed } = tagAttrs;
+    const k = tagAttrs.k;
     if (!closed) {
       if (k >= end) {
         // thẻ dở dang tới hết đoạn (vd mảnh HTML trong chuỗi JS: '<input value="' + x) -> giữ nguyên, không phải chữ
@@ -272,6 +244,96 @@ export function lexHtml(src, start = 0, end = src.length) {
   }
   flushText(end);
   return tokens;
+}
+
+/** Đọc danh sách thuộc tính của thẻ từ vị trí k tới dấu > — trả về { attrs, k (sau >), selfClose, closed } */
+function lexAttrs(src, k, end) {
+  const attrs = [];
+  let selfClose = false, closed = false;
+  while (k < end) {
+    while (k < end && /\s/.test(src[k])) k++;
+    if (src[k] === '>') { closed = true; k++; break; }
+    if (src[k] === '/' && src[k + 1] === '>') { selfClose = true; closed = true; k += 2; break; }
+    if (src[k] === '/') { k++; continue; }
+    if (src[k] === '<') break; // thẻ lỗi
+    const nS = k;
+    while (k < end && !/[\s=>]/.test(src[k]) && !(src[k] === '/' && src[k + 1] === '>')) k++;
+    const nE = k;
+    if (nE === nS) { k++; continue; }
+    while (k < end && /\s/.test(src[k])) k++;
+    if (src[k] === '=') {
+      k++;
+      while (k < end && /\s/.test(src[k])) k++;
+      const q = src[k];
+      if (q === '"' || q === "'") {
+        const vS = k + 1;
+        let vE = src.indexOf(q, vS);
+        if (vE < 0 || vE > end) vE = end;
+        attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: vS, vEnd: vE, quote: q });
+        k = vE + 1;
+      } else {
+        const vS = k;
+        while (k < end && !/[\s>]/.test(src[k])) k++;
+        attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: vS, vEnd: k, quote: '' });
+      }
+    } else {
+      attrs.push({ name: src.slice(nS, nE), nStart: nS, nEnd: nE, vStart: -1, vEnd: -1, quote: '' });
+    }
+  }
+  return { attrs, k, selfClose, closed };
+}
+
+const QUOTE_IN_NAME = /["']/;
+const CJK_IN_NAME = /[⺀-鿿豈-﫿＀-￯]/;
+
+/**
+ * Giá trị thuộc tính có dấu nháy lồng KHÔNG escape, vd:
+ *   data-prompt="…当被问及"闪闪发光"的留学生活时… 【/开场白】">
+ * Đọc đúng chuẩn HTML thì giá trị kết thúc ở nháy lồng đầu tiên, phần sau thành một dãy "thuộc tính rác" -> không được
+ * dịch (sót chữ Hán) và nhãn đóng 【/开场白】 không được đổi theo từ điển (regex sau dịch hết khớp).
+ * Ở đây ta nhận ra trường hợp đó và kéo giá trị tới nháy đóng thật: nháy cùng loại mà theo sau là khoảng trắng / dấu >
+ * và phần còn lại của thẻ đọc ra các thuộc tính sạch. Thuộc tính được đánh dấu `recovered` để bộ phân tích giữ nguyên
+ * từng dấu nháy lồng (mã gốc không bị đổi).
+ */
+function recoverBrokenQuotes(src, r, end) {
+  for (let n = 0; n < r.attrs.length; n++) {
+    const a = r.attrs[n];
+    if (!a.quote || a.vEnd >= end) continue;
+    if (!brokenAfter(src, r.attrs, n, end)) continue;
+    const limit = Math.min(end, a.vStart + 40000);
+    let p = a.vEnd;
+    for (let tries = 0; tries < 80; tries++) {
+      p = src.indexOf(a.quote, p + 1);
+      if (p < 0 || p >= limit) break;
+      const nx = src[p + 1];
+      if (!(/[\s>]/.test(nx || ' ') || (nx === '/' && src[p + 2] === '>'))) continue;
+      const rest = lexAttrs(src, p + 1, end);
+      if (!rest.closed || rest.attrs.some((x) => QUOTE_IN_NAME.test(x.name))) continue;
+      a.vEnd = p; a.recovered = true;
+      r.attrs = [...r.attrs.slice(0, n + 1), ...rest.attrs];
+      r.k = rest.k; r.selfClose = rest.selfClose;
+      break;
+    }
+  }
+}
+
+/** Nháy đóng của thuộc tính thứ n có phải nháy lồng (giá trị bị cắt sớm) không */
+function brokenAfter(src, attrs, n, end) {
+  const a = attrs[n];
+  // 1) ngay sau nháy đóng dính liền một "tên thuộc tính" không thể có (chứa nháy hoặc chữ CJK)
+  const after = src[a.vEnd + 1];
+  if (after !== undefined && a.vEnd + 1 < end && !/[\s>/]/.test(after)) {
+    let t = a.vEnd + 1;
+    while (t < end && !/[\s=>]/.test(src[t])) t++;
+    const tok = src.slice(a.vEnd + 1, t);
+    if (QUOTE_IN_NAME.test(tok) || CJK_IN_NAME.test(tok)) return true;
+  }
+  // 2) các "thuộc tính" không giá trị đứng sau (tới thuộc tính có giá trị kế tiếp) có tên chứa dấu nháy
+  for (let i = n + 1; i < attrs.length; i++) {
+    if (attrs[i].vStart >= 0) break;
+    if (QUOTE_IN_NAME.test(attrs[i].name)) return true;
+  }
+  return false;
 }
 
 // ============================================================== CSS

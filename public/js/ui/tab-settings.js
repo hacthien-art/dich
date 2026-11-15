@@ -47,8 +47,9 @@ export function create(app, el) {
         h('div', null,
           field('Từ khóa kích hoạt lorebook (keys)', select({ append: 'Giữ từ khóa gốc + thêm bản dịch (khuyên dùng)', replace: 'Thay bằng bản dịch', keep: 'Giữ nguyên' }, ts.keysMode, (v) => { ts.keysMode = v; save(); app.project?.bump(); })),
           field('Chuỗi tiếng Trung trong mã JS (HTML/script)', select({ smart: 'Thông minh — dịch chữ hiển thị, giữ chuỗi dùng làm khóa/so sánh', all: 'Dịch mọi chuỗi (trừ biến đã đồng bộ)', none: 'Không dịch chuỗi trong mã' }, ts.codeStrings, (v) => { ts.codeStrings = v; reanalyze(); })),
-          checkbox('Dịch cả chuỗi trong mã EJS (<% %>) — mặc định chỉ đồng bộ biến', !!ts.ejsStrings, (v) => { ts.ejsStrings = v; reanalyze(); }, 'Mặc định: chuỗi trong thẻ xuất <%= %> / <%- %> và print() được dịch; chuỗi trong thẻ mã <% %> giữ nguyên (thường là điều kiện so sánh, tên mục lorebook ghép động). Bật nếu card chỉ dùng EJS để hiển thị chữ.'),
+          checkbox('Dịch cả chuỗi ngắn trong mã EJS (<% %>)', !!ts.ejsStrings, (v) => { ts.ejsStrings = v; reanalyze(); }, 'Mặc định: chuỗi trong thẻ xuất <%= %> / <%- %>, print() và chuỗi là CÂU VĂN trong thẻ mã <% %> (có dấu câu tiếng Trung hoặc dài, vd notes.push(\'…，…\')) được dịch; chuỗi ngắn (giá trị trạng thái, tên) và chuỗi dùng để so sánh / làm khóa / gọi getwi(), setvar() giữ nguyên để logic không hỏng. Bật nếu card chỉ dùng EJS để hiển thị chữ. Chuỗi ngắn còn sót có thể thêm vào từ điển ở tab 🩺 Kiểm tra.'),
           checkbox('Dịch chú thích trong mã (<!-- -->, //, /* */, <%# %>)', !!ts.comments, (v) => { ts.comments = v; reanalyze(); }, 'Chú thích không ảnh hưởng chạy mã; bản dịch được ép trên 1 dòng với // và không thể đóng chú thích sớm.'),
+          checkbox('Regex nhận cả dấu câu ASCII thay cho dấu toàn độ rộng (：，（）…)', ts.widenRegex !== false, (v) => { ts.widenRegex = v; reanalyze(); }, 'Bản dịch tiếng Việt viết "Độ hảo cảm: 50" chứ không phải "Độ hảo cảm：50". Bật: find regex / regex trong mã đổi "：" thành "[：:]\\s*" (nhóm không bắt, không đổi số thứ tự $1, $2) để vẫn khớp. Tắt: giữ nguyên regex và bắt bản dịch giữ đúng dấu toàn độ rộng.'),
         ),
       ),
     );

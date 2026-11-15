@@ -191,7 +191,7 @@ export function create(app, el) {
         const ts = app.ts();
         const a = analyzeItem({ kind: 'auto', text: sampleText, meta: {} }, { dict: p.dictIndex(ts), entryNames: new Set(), opts: { codeStrings: ts.codeStrings, chunkSize: ts.chunkSize } });
         const tm = new Map(p.tm);
-        await runTranslation({ segments: a.segments.filter((s) => !tm.has(s.key)), tm, settings: { ...ts, concurrency: 2 }, conn, preset: app.preset.data, dict: p.data.dict, cardName: p.cardName, glossary: p.data.glossary, onLog: (m, l) => app.log(m, l) });
+        await runTranslation({ segments: a.segments.filter((s) => !tm.has(s.key)), tm, settings: { ...ts, concurrency: 2 }, conn, preset: app.preset.data, dict: p.data.dict, cardName: p.cardName, glossary: p.data.glossary, guard: p.guard, onLog: (m, l) => app.log(m, l) });
         sampleTr = a.render({ tm, dict: p.dictIndex(ts) });
         toast('Đã dịch tin mẫu — bấm "Thêm làm tin AI" để xem', 'ok');
         const last = chat[chat.length - 1];

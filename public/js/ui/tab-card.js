@@ -154,7 +154,10 @@ export function create(app, el) {
             h('button', { class: 'btn primary', disabled: !!app.running, onclick: () => app.translateAll() }, '▶ Dịch toàn bộ'),
             h('button', { class: 'btn', disabled: !!app.running || !p.problemSegments().length, onclick: () => app.translateAll(null, { problems: true }) }, `🔁 Dịch chỗ thiếu/lỗi (${p.problemSegments().length})`),
             h('button', { class: 'btn', onclick: () => app.showTab('vars') }, '🧬 Xem bảng biến'),
-            h('button', { class: 'btn', onclick: () => app.showTab('preview') }, '🧩 Xem trước regex/HTML')),
+            h('button', { class: 'btn', onclick: () => app.showTab('preview') }, '🧩 Xem trước regex/HTML'),
+            h('button', { class: 'btn', onclick: () => app.showTab('check') }, '🩺 Kiểm tra tổng thể'),
+            h('button', { class: 'btn', disabled: !!app.running, title: 'Tác giả ra bản mới của card? Chọn file mới — giữ toàn bộ bản dịch, chỉ dịch phần thay đổi', onclick: () => app.updateCardDialog() }, '🔄 Cập nhật card')),
+          p.data.updates?.length ? h('div', { class: 'muted small', style: { marginTop: '6px' } }, `Đã cập nhật card ${p.data.updates.length} lần — gần nhất: ${p.data.updates[p.data.updates.length - 1].fileName} (${new Date(p.data.updates[p.data.updates.length - 1].at).toLocaleString('vi-VN')})`) : null,
         )),
       warns.length ? h('div', { class: 'card-box tight' }, h('b', { class: 'warn' }, '⚠ Cần kiểm tra thủ công:'), h('ul', { class: 'small' }, warns.slice(0, 12).map((w) => h('li', null, w)))) : null,
       h('div', { class: 'muted' }, '← Chọn một mục bên trái để xem bản gốc / bản dịch và sửa từng đoạn.'),
@@ -224,7 +227,7 @@ export function create(app, el) {
           ta.addEventListener('change', () => {
             const v = ta.value;
             if (!v.trim()) { p.clearTranslations([k]); app.saveProject(); renderEditor(); liveUpdate(); return; }
-            const val = validateSegment(seg, v, allowedHanSet(p.data.dict, app.ts(), p.data.glossary));
+            const val = validateSegment(seg, v, allowedHanSet(p.data.dict, app.ts(), p.data.glossary), { guard: p.guard });
             if (!val.ok && !val.soft) { toast('Không lưu: ' + val.reason + '. Bản dịch phải giữ đủ các ⟦n⟧.', 'err', 5000); return; }
             p.setTranslation(k, val.out ?? v, val.ok ? val.warn : val.reason);
             app.saveProject();

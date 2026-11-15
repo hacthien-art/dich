@@ -23,6 +23,7 @@
     <div class="top-actions">
       <button id="btnUpdate" class="btn update" hidden title="Có bản mới trên GitHub">⬆ Cập nhật</button>
       <button id="btnImport" class="btn">📥 Nhập card</button>
+      <button id="btnUpdateCard" class="btn" disabled title="Card có phiên bản mới? Chọn file mới để cập nhật dự án đang mở — giữ toàn bộ bản dịch, chỉ dịch phần thay đổi">🔄 Cập nhật card</button>
       <button id="btnTranslateAll" class="btn primary" disabled>▶ Dịch toàn bộ</button>
       <button id="btnRetry" class="btn" disabled title="Dịch lại các đoạn chưa dịch hoặc bị lỗi / còn sót chữ Hán">🔁 Dịch chỗ thiếu/lỗi</button>
       <button id="btnStop" class="btn danger" hidden>■ Dừng</button>
@@ -46,6 +47,7 @@
     <button class="tab" data-tab="card"><span>📇</span>Card &amp; Bản dịch</button>
     <button class="tab" data-tab="vars"><span>🧬</span>Biến &amp; Đồng bộ</button>
     <button class="tab" data-tab="preview"><span>🧩</span>Regex &amp; Xem trước</button>
+    <button class="tab" data-tab="check"><span>🩺</span>Kiểm tra <em id="checkBadge" class="badge" hidden>0</em></button>
     <button class="tab" data-tab="settings"><span>⚙️</span>Cài đặt dịch</button>
     <button class="tab" data-tab="log"><span>📜</span>Nhật ký <em id="logBadge" class="badge" hidden>0</em></button>
     <div class="sidebar-foot muted small">Chạy cục bộ · dữ liệu lưu trong thư mục <code>data/</code><div id="appVersion" class="app-version"></div></div>
@@ -57,6 +59,7 @@
     <section class="panel" id="tab-card"></section>
     <section class="panel" id="tab-vars"></section>
     <section class="panel" id="tab-preview"></section>
+    <section class="panel" id="tab-check"></section>
     <section class="panel" id="tab-settings"></section>
     <section class="panel" id="tab-log"></section>
   </main>

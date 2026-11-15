@@ -209,9 +209,18 @@ class Scanner {
     let inClass = false;
     for (let i = 0; i < findRegex.length;) {
       const c = findRegex[i];
-      if (c === '\\') { i += 2; continue; }
+      if (c === '\\') {
+        // \k<tên nhóm>: tham chiếu nhóm có tên — không phải nhãn
+        if (findRegex[i + 1] === 'k' && findRegex[i + 2] === '<') { const close = findRegex.indexOf('>', i); i = close > 0 ? close + 1 : i + 2; } else i += 2;
+        continue;
+      }
       if (inClass) { if (c === ']') inClass = false; i++; continue; }
       if (c === '[') { inClass = true; i++; continue; }
+      // (?<tên nhóm>…): tên nhóm được giữ nguyên trong regex nên không đưa vào từ điển
+      if (c === '(' && findRegex[i + 1] === '?' && findRegex[i + 2] === '<' && findRegex[i + 3] !== '=' && findRegex[i + 3] !== '!') {
+        const close = findRegex.indexOf('>', i + 3);
+        if (close > 0) { i = close + 1; continue; }
+      }
       if (runRe.test(c)) {
         let j = i;
         while (j < findRegex.length && runRe.test(findRegex[j])) j++;
@@ -278,13 +287,43 @@ export function stripAccents(s) {
   return s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
 }
 
+// nhãn phân loại model lỡ chép vào cuối bản dịch: "Nguyên Ngọc Nghi [biến]", "vô [giá trị]"
+const KIND_TAG_TAIL_RE = /\s*[\[【［(（]\s*(?:tên\s+)?(?:biến|giá\s*trị|nhãn|thuật\s*ngữ|key|value|marker|term)\s*[\]】］)）}]\s*$/i;
+
 export function sanitizeName(dst, kind) {
   let s = String(dst ?? '').replace(/[\r\n\t]+/g, ' ').trim();
   // bỏ thẻ/nháy bao ngoài mà model có thể lỡ trả về
   s = s.replace(/^<[^>]*>|<\/[^>]*>$/g, '').replace(/^["'“”「」『』]+|["'“”「」『』]+$/g, '').trim();
+  s = s.replace(KIND_TAG_TAIL_RE, '').trim();
   if (kind === 'key') s = s.replace(/[.\/\[\]'"`\\:#{}<>]/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  // nhãn được chèn vào regex / chuỗi JS / thuộc tính HTML ở nhiều ngữ cảnh -> không cho ký tự có thể phá cú pháp
+  else if (kind === 'marker') s = s.replace(/[<>"'`\\]/g, '').replace(/\s{2,}/g, ' ').trim();
   else s = s.replace(/[<>]/g, '').trim();
   return s;
+}
+
+/** Gỡ nhãn phân loại ("… [biến]") bị lưu lẫn trong bản dịch của từ điển (dự án dịch bằng bản cũ). Trả về số mục đã sửa */
+export function cleanDictTags(dict) {
+  let n = 0;
+  for (const v of Object.values(dict || {})) {
+    if (!v || typeof v.dst !== 'string' || !KIND_TAG_TAIL_RE.test(v.dst)) continue;
+    v.dst = v.dst.replace(KIND_TAG_TAIL_RE, '').trim();
+    n++;
+  }
+  return n;
+}
+
+/** Mục được giữ nguyên tiếng Trung một cách CỐ Ý (người dùng tích "Giữ", hoặc cả loại đang ở chế độ giữ nguyên) */
+export function isKeptEntry(v, settings = {}) {
+  if (!v) return false;
+  if (v.keep) return true;
+  if ((v.kind === 'key' || v.kind === 'value') && (settings.varMode || 'translate') === 'keep') return true;
+  return v.kind === 'marker' && (settings.markerMode || 'translate') === 'keep';
+}
+
+/** Khóa so sánh tên biến: không phân biệt hoa/thường và khoảng trắng/gạch dưới ("Chân" và "chân" bị coi là trùng) */
+export function conflictKey(name) {
+  return String(name ?? '').normalize('NFC').toLocaleLowerCase('vi').replace(/[\s_]+/g, ' ').trim();
 }
 
 export function applyStyle(dst, style, kind, src = '') {
@@ -315,7 +354,8 @@ export function mergeScan(oldDict, scanEntries) {
   for (const e of scanEntries) {
     const old = oldDict?.[e.src];
     out[e.src] = {
-      kind: e.kind,
+      // loại do người dùng tự chọn trong bảng được giữ qua các lần quét lại (trước đây bị quét đè mất)
+      kind: old?.kindManual && old.kind ? old.kind : e.kind,
       dst: old?.dst ?? '',
       keep: old?.keep ?? false,
       manual: old?.manual ?? false,
@@ -323,6 +363,8 @@ export function mergeScan(oldDict, scanEntries) {
       parents: e.parents,
       samples: e.samples,
     };
+    if (old?.auto) out[e.src].auto = true;
+    if (old?.kindManual) out[e.src].kindManual = true;
   }
   // giữ mục người dùng tự thêm
   for (const [src, v] of Object.entries(oldDict || {})) {
@@ -348,32 +390,49 @@ export function makeDictIndex(dict, settings = {}) {
       if ((v.kind === 'key' || v.kind === 'value') && varMode === 'keep') return src;
       if (v.kind === 'marker' && markerMode === 'keep') return src;
       if (!v.dst) return src;
-      return v.kind === 'key' ? applyStyle(v.dst, style, 'key', src) : sanitizeName(v.dst, v.kind);
+      const out = v.kind === 'key' ? applyStyle(v.dst, style, 'key', src) : sanitizeName(v.dst, v.kind);
+      return out || src; // bản dịch chỉ toàn ký tự bị lọc -> coi như chưa dịch
     },
   };
 }
 
-/** Phát hiện xung đột: 2 khóa khác nhau -> cùng tên mới trong cùng object cha */
+/**
+ * Phát hiện xung đột: 2 khóa khác nhau -> cùng tên mới trong cùng object cha.
+ * So sánh KHÔNG phân biệt hoa/thường: "Chân" (足) và "chân" (腿) trong cùng object là 2 khóa khác nhau với JS/YAML
+ * nhưng AI nhập vai cập nhật biến rất dễ ghi nhầm -> coi là trùng và đặt lại tên.
+ */
 export function findConflicts(dict, settings = {}) {
   const idx = makeDictIndex(dict, settings);
   const byParent = new Map();
   for (const [src, v] of Object.entries(dict || {})) {
     if (v.kind !== 'key') continue;
     const dst = idx.lookup(src);
+    const norm = conflictKey(dst);
     for (const p of (v.parents?.length ? v.parents : [''])) {
-      const k = p + '\u0000' + dst;
-      if (!byParent.has(k)) byParent.set(k, new Set());
-      byParent.get(k).add(src);
+      const k = p + '\u0000' + norm;
+      let g = byParent.get(k);
+      if (!g) { g = { parent: p, dst, srcs: new Set() }; byParent.set(k, g); }
+      g.srcs.add(src);
     }
   }
   const out = [];
-  for (const [k, set] of byParent) {
-    if (set.size > 1) {
-      const [parent, dst] = k.split('\u0000');
-      out.push({ parent, dst, srcs: [...set] });
-    }
-  }
+  for (const g of byParent.values()) if (g.srcs.size > 1) out.push({ parent: g.parent, dst: g.dst, srcs: [...g.srcs] });
   return out;
+}
+
+/**
+ * Các mục từ điển có vấn đề (cần dịch mà chưa dịch / AI trả về vẫn còn chữ Hán).
+ * Trả về { untranslated:[src], hanLeft:[src] } — không tính mục cố ý giữ nguyên hay bản dịch sửa tay.
+ */
+export function dictProblems(dict, settings = {}) {
+  const idx = makeDictIndex(dict || {}, settings);
+  const untranslated = [], hanLeft = [];
+  for (const [src, v] of Object.entries(dict || {})) {
+    if (!v || !hasCJK(src) || isKeptEntry(v, settings)) continue;
+    if (!v.dst || !String(v.dst).trim()) { untranslated.push(src); continue; }
+    if (!v.manual && hasCJK(idx.lookup(src))) hanLeft.push(src);
+  }
+  return { untranslated, hanLeft };
 }
 
 /** Thuật ngữ liên quan tới đoạn văn (để đưa vào prompt) */
@@ -384,8 +443,13 @@ export function glossaryFor(texts, dict, settings, extraGlossary = []) {
   const seen = new Set();
   for (const [src, v] of Object.entries(dict || {})) {
     if (!joined.includes(src)) continue;
+    const kept = isKeptEntry(v, settings);
+    // mục CHƯA có bản dịch: không đưa "gốc → gốc" vào bảng (model sẽ hiểu là phải giữ nguyên chữ Hán)
+    if (!kept && !v.dst) continue;
     const dst = idx.lookup(src);
     if (!dst) continue;
+    // AI gợi ý mà vẫn trả về chữ Hán (không dịch được) -> bỏ, để model tự dịch trong ngữ cảnh
+    if (!kept && !v.manual && hasCJK(dst)) continue;
     seen.add(src);
     out.push({ src, dst, kind: v.kind });
   }

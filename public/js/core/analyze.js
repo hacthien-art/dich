@@ -17,6 +17,16 @@ const KEEP_ARG_FUNCS = new Set(['getButtonEvent', 'eventOn', 'eventOnce', 'event
 const PATH_FUNCS = new Set(['getvar', 'setvar', 'incvar', 'decvar', 'addvar', 'delvar', 'getVariable', 'setVariable', 'get', 'set', 'has', 'unset', 'update', 'getMvuVariable', 'setMvuVariable', 'getLocalVar', 'setLocalVar', 'getGlobalVar', 'setGlobalVar', 'getMessageVar', 'setMessageVar', 'getChatVar', 'setChatVar', 'deleteVariable', 'insert', 'remove', 'add', 'assign', 'delete', 'move', 'patchVariables']);
 const MACRO_PATH_RE = /^\{\{\s*(getvar|setvar|addvar|incvar|decvar|getglobalvar|setglobalvar|addglobalvar|incglobalvar|decglobalvar|get_message_variable|get_chat_variable|get_character_variable|get_preset_variable|get_global_variable|format_message_variable|format_chat_variable|format_character_variable|format_global_variable|format_preset_variable)\s*::\s*/i;
 const YAML_PLAIN_BAD = /^[-?:,[\]{}#&*!|>'"%@`]|:\s|\s#|^\s|\s$|^$/;
+// thẻ giả tên tiếng Trung trong khóa đoạn dịch: "<正文", "</姬悠馨_id40", hoặc "<⟦1⟧" / "</⟦1⟧" (tên là hole)
+const PSEUDO_TAG_RE = /<\/?(?:[⺀-鿿豈-﫿]|⟦)/;
+// dấu câu toàn độ rộng mà bản dịch tiếng Việt thường đổi sang dấu ASCII (kèm khoảng trắng) -> dạng "nới" cho regex
+const REGEX_PUNCT = {
+  '：': '[：:]\\s*', '，': '[，,]\\s*', '；': '[；;]\\s*', '。': '[。.]\\s*', '！': '[！!]\\s*', '？': '[？?]\\s*', '、': '[、,]\\s*',
+  '（': '\\s*[（(]', '）': '[）)]', '“': '["“”]', '”': '["“”]', '‘': "['‘’]", '’': "['‘’]",
+};
+// dấu ASCII tương ứng để thêm vào trong lớp ký tự [...] (không thêm "." cạnh "。": lớp như [。！？] dùng để tách câu
+// sẽ cắt nhầm số thập phân "3.5")
+const REGEX_PUNCT_ASCII = { '：': ':', '，': ',', '；': ';', '！': '!', '？': '?', '、': ',', '（': '\\(', '）': '\\)', '“': '"', '”': '"', '‘': "'", '’': "'" };
 
 /** Văn bản có vẻ là HTML (có thẻ chuẩn) */
 export function looksLikeHtml(s) { return HTML_HINT_RE.test(s); }
@@ -174,7 +184,11 @@ class Analyzer {
    */
   textRun(parent, start, end, o = {}) {
     const src = this.src;
-    const esc = o.esc || identity;
+    // o.htmlText: đây là chữ trong HTML -> "<chữ" do bản dịch sinh ra phải thành &lt; (không tạo thẻ mới).
+    // Riêng đoạn mà bản gốc có thẻ giả tên tiếng Trung (<正文>, </姬悠馨_id40>) thì KHÔNG escape: bản dịch
+    // <Chính văn> phải giữ nguyên dấu < — trước đây thành "&lt;Chính văn>" làm regex/cấu trúc prompt mất ký tự.
+    const baseEsc = o.esc || identity;
+    const esc = o.htmlText ? compose(htmlTextEsc, baseEsc) : baseEsc;
     const given = (o.holes || []).filter((h) => h.start >= start && h.end <= end);
     // cắt khoảng trắng 2 đầu (không cắt vào hole)
     let s = start, e = end;
@@ -242,7 +256,7 @@ class Analyzer {
       if (!segHasCJK && hasCJK(tail)) segHasCJK = true;
       key += tail;
       if (!segHasCJK) { this.flushHoles(parent, hs, esc); continue; }
-      const seg = this.newSeg(key, segHoles, o.kind || 'prose', esc);
+      const seg = this.newSeg(key, segHoles, o.kind || 'prose', o.htmlText && PSEUDO_TAG_RE.test(key) ? baseEsc : esc);
       parent.reps.push({ start: a, end: b, render: (env) => renderSegment(seg, env) });
     }
   }
@@ -268,6 +282,7 @@ class Analyzer {
     const text = src.slice(s, e);
     const out = [];
     const add = (a, b, hole) => { out.push({ start: s + a, end: s + b, hole }); };
+    const refs = o.regexRefs || this.regexRefs;
     let m;
     // data URI dạng base64 dài (nhúng font/ảnh/âm thanh): giữ nguyên, không cắt nhỏ hay gửi AI
     if (text.includes(';base64,')) {
@@ -289,22 +304,28 @@ class Analyzer {
       const re = /\{\{[\s\S]*?\}\}/g;
       while ((m = re.exec(text))) {
         const mm = m[0];
-        if (/^\{\{\s*match\s*\}\}$/i.test(mm) && o.regexRefs) { add(m.index, m.index + mm.length, this.rawHole(s + m.index, s + m.index + mm.length)); continue; }
+        if (/^\{\{\s*match\s*\}\}$/i.test(mm) && refs) { add(m.index, m.index + mm.length, this.rawHole(s + m.index, s + m.index + mm.length)); continue; }
         const pm = MACRO_PATH_RE.exec(mm);
         if (pm && hasCJK(mm)) add(m.index, m.index + mm.length, { type: 'macro', src: mm, esc: true });
       }
     }
-    // $1 / $<name> / $& trong replaceString
-    if (o.regexRefs) {
+    // $1 / $<name> / $& trong replaceString — ở MỌI ngữ cảnh của mục (chữ HTML, thuộc tính, chuỗi JS, CSS):
+    // ST thay $1 trên toàn bộ replaceString, nên model làm mất/đổi $1 ở đâu cũng hỏng
+    if (refs && text.includes('$')) {
       const re = /\$(\d+|<[^>]+>|&)/g;
       while ((m = re.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
     }
     if (o.entities) {
       const re = /&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);/gi;
       while ((m = re.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
-      // "<chữ" lạc trong văn bản HTML (thẻ hỏng) -> giữ nguyên, tránh bị escape thành &lt;
-      const re2 = /<[A-Za-z\/!?][^<>\s]*/g;
-      while ((m = re2.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
+      // "<chữ" lạc trong văn bản HTML (thẻ hỏng) -> giữ nguyên, tránh bị escape thành &lt;.
+      // Dừng trước chữ Hán: "</状态栏" chỉ còn "</" và được bỏ qua -> tên thẻ vẫn được đổi theo nhãn / được dịch
+      // cùng với thẻ mở (trước đây "</状态栏" bị giữ nguyên trong khi "<状态栏>" được dịch -> cặp thẻ lệch nhau).
+      const re2 = /<[A-Za-z\/!?][^<>\s⺀-鿿豈-﫿]*/g;
+      while ((m = re2.exec(text))) {
+        if (m[0] === '</') continue;
+        add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
+      }
     }
     if (o.jsEscapes) {
       const re = /\\(?:u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g;
@@ -365,12 +386,14 @@ class Analyzer {
         void b;
       }
     }
-    // marker trong ngoặc: 【开场白】 【/开场白】 <开场白>
+    // marker trong ngoặc: 【开场白】 【/开场白】 <开场白> — hole bao CẢ cặp ngoặc để model không thể đổi/làm mất
+    // ngoặc (【】 -> [], bỏ dấu <>…), vì find regex khớp đúng từng ký tự đó
     if (this.markerRe) {
       this.markerRe.lastIndex = 0;
       while ((m = this.markerRe.exec(text))) {
-        const a = m.index + m[1].length + m[2].length;
-        add(a, a + m[3].length, this.dictHole(m[3], 'marker'));
+        if (m[1] === '<' && isGroupNameAt(src, s + m.index)) continue; // $<tên>, (?<tên>, \k<tên> của regex — không phải nhãn
+        const b = m.index + m[0].length + 1; // + ngoặc đóng (regex chỉ nhìn trước)
+        add(m.index, b, { type: 'marker', open: m[1] + m[2], src: m[3], close: text[b - 1], esc: false });
       }
     }
     // bỏ các vùng nằm trong hole đã có (dùng tìm kiếm nhị phân O(log G) thay vì O(G))
@@ -501,7 +524,7 @@ class Analyzer {
         } else if (t.tag === 'style') {
           this.cssRange(parent, t.start, t.end, outerEsc);
         } else {
-          this.textRun(parent, t.start, t.end, { esc: compose(htmlTextEsc, outerEsc), kind: 'ui', entities: true, regexRefs: o.regexRefs, jsEscapes: o.jsEscapes });
+          this.textRun(parent, t.start, t.end, { esc: outerEsc, htmlText: true, kind: 'ui', entities: true, regexRefs: o.regexRefs, jsEscapes: o.jsEscapes });
         }
       } else if (t.type === 'comment' && this.opts.comments && hasCJK(src.slice(t.start, t.end))) {
         const ce = src.startsWith('-->', t.end - 3) && t.end - 3 >= t.start + 4 ? t.end - 3 : t.end;
@@ -530,7 +553,7 @@ class Analyzer {
     }
     for (const k of masks) if (k.start >= start && k.end <= end) { holes.push(k); used.add(k); }
     holes.sort((x, y) => x.start - y.start);
-    this.textRun(parent, start, end, { holes, esc: compose(htmlTextEsc, outerEsc), kind: 'ui', entities: true, regexRefs: o.regexRefs, yamlKeys: o.yamlKeys, jsEscapes: o.jsEscapes });
+    this.textRun(parent, start, end, { holes, esc: outerEsc, htmlText: true, kind: 'ui', entities: true, regexRefs: o.regexRefs, yamlKeys: o.yamlKeys, jsEscapes: o.jsEscapes });
   }
 
   htmlAttrs(node, t, outerEsc, masks, used, jsEscapes) {
@@ -539,8 +562,14 @@ class Analyzer {
       if (at.vStart < 0) continue;
       const name = at.name.toLowerCase();
       const raw = src.slice(at.vStart, at.vEnd);
-      const inMask = masks.filter((k) => k.start >= at.vStart && k.end <= at.vEnd);
+      let inMask = masks.filter((k) => k.start >= at.vStart && k.end <= at.vEnd);
       inMask.forEach((k) => used.add(k));
+      // giá trị có nháy lồng không escape (lexer đã kéo tới nháy đóng thật): giữ nguyên từng dấu nháy lồng
+      if (at.recovered) {
+        const inner = [];
+        for (let p = at.vStart; p < at.vEnd; p++) if (src[p] === at.quote && !inMask.some((k) => p >= k.start && p < k.end)) inner.push({ start: p, end: p + 1, hole: this.rawHole(p, p + 1) });
+        inMask = [...inMask, ...inner].sort((a, b) => a.start - b.start);
+      }
       const esc = compose(attrEsc(at.quote || '"'), outerEsc);
       if (name.startsWith('on')) {
         if (/[㐀-鿿]|stat_data/.test(raw)) this.jsRange(node, at.vStart, at.vEnd, { mode: 'attr', esc: compose(attrEsc(at.quote || '"'), outerEsc) });
@@ -647,27 +676,7 @@ class Analyzer {
     const src = this.src;
     const close = src.lastIndexOf('/', end - 1);
     if (close <= start) return true;
-    const runRe = new RegExp('[' + HAN_CLASS + '\\u3040-\\u30FF]');
-    let left = false, inClass = false;
-    for (let i = start + 1; i < close;) {
-      const c = src[i];
-      if (c === '\\') { i += 2; continue; }
-      if (inClass) { if (c === ']') inClass = false; else if (runRe.test(c)) left = true; i++; continue; }
-      if (c === '[') { inClass = true; i++; continue; }
-      if (runRe.test(c)) {
-        let j = i;
-        while (j < close && runRe.test(src[j])) j++;
-        const word = src.slice(i, j);
-        const k = this.dict.kindOf(word);
-        if (k === 'marker' || k === 'key' || k === 'value') {
-          const hole = this.dictHole(word, k);
-          parent.reps.push({ start: i, end: j, render: (env) => outerEsc(escapeRegex(renderHole(hole, env))) });
-        } else left = true;
-        i = j; continue;
-      }
-      i++;
-    }
-    return left;
+    return this.regexBody(parent, start + 1, close, outerEsc);
   }
 
   jsIdent(parent, sig, i, braceStack, outerEsc, mode) {
@@ -723,7 +732,12 @@ class Analyzer {
     if (mode === 'ejs') {
       if (this.opts.ejsStrings) return 'smart';
       // <% print('…') %> in ra văn bản -> dịch
-      return enclosingCall(sig, i) === 'print' ? 'smart' : 'none';
+      if (enclosingCall(sig, i) === 'print') return 'smart';
+      // chuỗi là CÂU VĂN (có dấu câu tiếng Trung, hoặc dài) trong mã EJS hầu như luôn là chữ hiển thị / đưa vào prompt
+      // (vd notes.push('有机缘的槐叶、神仙钱…'), { khai: '他的因果起于贫寒，…' }) -> dịch theo quy tắc "thông minh"
+      // (chuỗi dùng làm khóa / so sánh / tham số getwi, setvar… vẫn giữ). Chuỗi ngắn (trạng thái, tên) vẫn giữ nguyên.
+      if (this.opts.codeStrings !== 'none' && proseLike(stringContent(this.src, sig[i]))) return 'smart';
+      return 'none';
     }
     return this.opts.codeStrings;
   }
@@ -986,6 +1000,14 @@ class Analyzer {
     const rep = this.exactRep(a, b, val, esc);
     if (rep) { parent.reps.push(rep); return; }
     if (this.pathInfo(val)) { const hole = this.pathHole(val); parent.reps.push({ start: a, end: b, render: (env) => esc(renderHole(hole, env)) }); return; }
+    if (esc === yamlPlainEsc) {
+      // giá trị trần: dựng xong CẢ giá trị rồi mới quyết định có cần bọc nháy không. Trước đây từng mảnh giữa các
+      // placeholder bị bọc nháy riêng -> giá trị có biến/đường dẫn ở giữa mà bản dịch chứa ": " hay " #" làm hỏng YAML.
+      const node = new Node(a, b);
+      this.textRun(node, a, b, { esc: identity, kind: 'prose', chunk: false, exact: false });
+      if (node.reps.length) parent.reps.push({ start: a, end: b, render: (env) => { const out = renderNode(this.src, node, env); return out === val ? out : yamlPlainEsc(out); } });
+      return;
+    }
     this.textRun(parent, a, b, { esc, kind: 'prose', chunk: false, yamlEscapes: dq, exact: false });
   }
 
@@ -1010,9 +1032,19 @@ class Analyzer {
   }
 
   // ====================================================================== regex find
-  regexFind(parent, start, end) {
+  regexFind(parent, start, end) { this.regexBody(parent, start, end, identity); }
+
+  /**
+   * Thân biểu thức regex (find regex của ST hoặc regex literal trong mã): đổi các cụm chữ Hán là mục từ điển.
+   * - Tên nhóm (?<名字>…) và tham chiếu \k<名字> được GIỮ NGUYÊN: tên nhóm không được có dấu cách, và $<名字> trong
+   *   replace cũng giữ nguyên nên hai bên vẫn khớp (trước đây tên nhóm bị dịch -> regex không hợp lệ, mất tác dụng).
+   * - Dấu câu toàn độ rộng ngoài [...] (： ， （ ）…) được nới thành dạng nhận cả dấu ASCII + khoảng trắng khi
+   *   env.widenRegex bật: bản dịch tiếng Việt viết "Độ hảo cảm: 50" chứ không phải "Độ hảo cảm：50".
+   * Trả về true nếu còn chữ Hán không ánh xạ được.
+   */
+  regexBody(parent, start, end, esc) {
     const src = this.src;
-    let inClass = false;
+    let inClass = false, left = false, classBody = '';
     let i = start;
     const runRe = new RegExp('[' + HAN_CLASS + '\\u3040-\\u30FF]');
     while (i < end) {
@@ -1020,13 +1052,34 @@ class Analyzer {
       if (c === '\\') {
         const n = src[i + 1];
         if ((n === 'u' || n === 'p' || n === 'P') && src[i + 2] === '{') { const close = src.indexOf('}', i); i = close > 0 ? close + 1 : i + 2; }
+        else if (n === 'k' && src[i + 2] === '<') { const close = src.indexOf('>', i); i = close > 0 && close < end ? close + 1 : i + 2; }
         else if (n === 'u') i += 6;
         else if (n === 'x') i += 4;
         else i += 2;
         continue;
       }
-      if (inClass) { if (c === ']') inClass = false; i++; continue; }
-      if (c === '[') { inClass = true; i++; continue; }
+      if (inClass) {
+        if (c === ']') inClass = false;
+        else if (runRe.test(c)) left = true;
+        else if (REGEX_PUNCT_ASCII[c] && !classBody.includes(REGEX_PUNCT_ASCII[c].slice(-1))) {
+          // trong [...]: thêm dấu ASCII tương ứng cạnh dấu toàn độ rộng ([^：] -> [^：:])
+          const both = c + REGEX_PUNCT_ASCII[c];
+          parent.reps.push({ start: i, end: i + 1, render: (env) => (env.widenRegex ? esc(both) : c) });
+        }
+        i++; continue;
+      }
+      if (c === '[') {
+        inClass = true;
+        let j = i + 1;
+        while (j < end && src[j] !== ']') j += src[j] === '\\' ? 2 : 1;
+        classBody = src.slice(i + 1, Math.min(j, end));
+        i++; continue;
+      }
+      // (?<tên>…): bỏ qua tên nhóm; (?<=…) / (?<!…) là lookbehind, không phải tên nhóm
+      if (c === '(' && src[i + 1] === '?' && src[i + 2] === '<' && src[i + 3] !== '=' && src[i + 3] !== '!') {
+        const close = src.indexOf('>', i + 3);
+        if (close > 0 && close < end) { i = close + 1; continue; }
+      }
       if (runRe.test(c)) {
         let j = i;
         while (j < end && runRe.test(src[j])) j++;
@@ -1035,12 +1088,19 @@ class Analyzer {
         // nhãn, hoặc tên biến/giá trị xuất hiện trong regex (vd 好感度:(\d+)) -> cùng bản dịch với nơi khác
         if (k === 'marker' || k === 'key' || k === 'value') {
           const hole = this.dictHole(word, k);
-          parent.reps.push({ start: i, end: j, render: (env) => escapeRegex(renderHole(hole, env)) });
-        }
+          parent.reps.push({ start: i, end: j, render: (env) => esc(escapeRegex(renderHole(hole, env))) });
+        } else left = true;
         i = j; continue;
+      }
+      const wide = REGEX_PUNCT[c];
+      if (wide) {
+        const quant = /[?*+{]/.test(src[i + 1] || '');
+        const text = quant ? '(?:' + wide + ')' : wide;
+        parent.reps.push({ start: i, end: i + 1, render: (env) => (env.widenRegex ? esc(text) : c) });
       }
       i++;
     }
+    return left;
   }
 
   regexTrim(parent, start, end) {
@@ -1100,6 +1160,22 @@ function enclosingCall(sig, i) {
     } else if (depth === 0 && (s.value === ';' || s.value === '{' || s.value === '}')) return null;
   }
   return null;
+}
+
+/** Nội dung tĩnh của token chuỗi / template literal */
+function stringContent(src, t) {
+  if (!t) return '';
+  if (t.type === 'str') return src.slice(t.cStart, t.cEnd);
+  if (t.type === 'tmpl') return (t.parts || []).filter((p) => p.type === 'str').map((p) => src.slice(p.start, p.end)).join(' ');
+  return '';
+}
+
+const HAN_COUNT_RE = new RegExp('[' + HAN_CLASS + ']', 'g');
+/** Chuỗi trông như câu văn hiển thị (không phải mã định danh / giá trị trạng thái ngắn) */
+function proseLike(s) {
+  const han = (String(s).match(HAN_COUNT_RE) || []).length;
+  if (han < 4) return false;
+  return /[，。！？；：、…—「」『』（）]/.test(s) || han >= 10;
 }
 
 /** Nội dung <style>/<script> thực ra là văn xuôi: có dấu câu CJK nằm ngoài chuỗi/chú thích (mã hợp lệ không thể có) */
@@ -1274,6 +1350,7 @@ export function renderHole(h, env) {
     case 'raw': return h.text;
     case 'node': return renderNode(env.src, h.node, env);
     case 'dict': return lookupDict(env, h.src);
+    case 'marker': return h.open + lookupDict(env, h.src) + h.close;
     case 'entry': return env.entryName ? env.entryName(h.src) ?? h.src : h.src;
     case 'book': return env.bookName ? env.bookName(h.src) ?? h.src : h.src;
     case 'path': return renderPath(h.src, env);
@@ -1348,6 +1425,7 @@ export function analyzeItem(item, ctx) {
   const an = new Analyzer(src, ctx);
   const root = new Node(0, src.length);
   const isReplace = !!item.meta?.isReplace;
+  an.regexRefs = isReplace;
   switch (kind) {
     case 'name': an.textRun(root, 0, src.length, { kind: 'name', chunk: false, exact: false, esc: src.includes('\n') ? identity : oneLine }); break;
     case 'comment': an.commentRange(root, 0, src.length); break;
@@ -1361,11 +1439,33 @@ export function analyzeItem(item, ctx) {
     case 'button': { const rep = an.exactRep(0, src.length, src, identity); if (rep) root.reps.push(rep); break; }
     default: an.proseRange(root, 0, src.length, { regexRefs: isReplace }); break;
   }
+  const markerRe = kind === 'regexFind' || kind === 'regexTrim' || kind === 'button' ? null : an.markerRe;
   return {
     segments: an.segments,
     warnings: an.warnings,
-    render(env) { return renderNode(src, root, { ...env, src }); },
+    render(env) { return sweepMarkers(renderNode(src, root, { ...env, src }), markerRe, env); },
   };
+}
+
+/**
+ * Quét cuối: nhãn trong ngoặc (【开场白】, </状态栏>…) còn nguyên tiếng Trung ở những vùng bộ phân tích không đụng tới
+ * (thuộc tính HTML hỏng nháy, chú thích không dịch, CSS, khối mã lạ…) vẫn phải đổi theo từ điển — regex của ST chạy
+ * trên văn bản thô nên nhãn mở/đóng ở MỌI nơi phải cùng một tên, nếu không regex sau dịch không khớp nữa.
+ */
+function sweepMarkers(out, markerRe, env) {
+  if (!markerRe || typeof out !== 'string' || !hasCJK(out)) return out;
+  markerRe.lastIndex = 0;
+  return out.replace(markerRe, (m, open, slash, word, offset, str) => {
+    if (open === '<' && isGroupNameAt(str, offset)) return m; // $<tên>, (?<tên>, \k<tên> của regex — không phải nhãn
+    const dst = lookupDict(env, word);
+    return dst === word ? m : open + slash + dst;
+  });
+}
+
+/** Dấu "<" tại vị trí i mở tên nhóm của regex: $<tên> (replace), (?<tên>…) (khai báo), \k<tên> (tham chiếu) */
+function isGroupNameAt(s, i) {
+  const p = s[i - 1];
+  return p === '$' || (p === '?' && s[i - 2] === '(') || (p === 'k' && s[i - 2] === '\\');
 }
 
 /** trimStrings của regex: chỉ đồng bộ nhãn theo từ điển */

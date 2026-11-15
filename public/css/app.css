@@ -190,6 +190,17 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .tree-json { font-family: var(--mono); font-size: 12px; white-space: pre; overflow: auto; max-height: 420px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
 .conflict { background: rgba(247, 118, 142, .08); border: 1px solid #6b2836; border-radius: 7px; padding: 8px 10px; margin-bottom: 8px; }
 
+/* ---------- check ---------- */
+.check-sec { padding: 10px 14px; }
+.check-sec.error { border-color: #6b2836; }
+.check-sec.warn { border-color: #6b5530; }
+.check-head { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; flex-wrap: wrap; }
+.check-icon { width: 18px; text-align: center; font-weight: 700; flex: none; }
+.check-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.check-row { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; padding: 5px 6px; border-radius: 6px; background: var(--bg2); word-break: break-word; }
+.check-row.muted { color: var(--muted); }
+.check-row .code-view { margin-top: 4px; max-height: 140px; }
+
 /* ---------- log ---------- */
 .log-list { font-family: var(--mono); font-size: 12px; }
 .log-list .l { padding: 3px 0; border-bottom: 1px solid #22252f; white-space: pre-wrap; word-break: break-word; }

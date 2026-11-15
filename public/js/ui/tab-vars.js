@@ -87,7 +87,7 @@ export function create(app, el) {
         });
         const keep = h('input', { type: 'checkbox', checked: !!v.keep, title: 'Giữ nguyên tiếng Trung' });
         keep.addEventListener('change', () => { v.keep = keep.checked; v.manual = true; p.bump(); p.touch(); app.saveProject(); res.textContent = makeDictIndex(p.data.dict, ts).lookup(src); });
-        const kindSel = select(KIND_NAMES, v.kind, (k) => { v.kind = k; v.manual = true; reanalyze(); });
+        const kindSel = select(KIND_NAMES, v.kind, (k) => { v.kind = k; v.kindManual = true; reanalyze(); });
         kindSel.style.width = '110px'; kindSel.style.padding = '3px 5px';
         tbl.appendChild(h('tr', null,
           h('td', { class: 'src' }, src, v.manual ? h('span', { class: 'muted small', title: 'Đã sửa tay' }, ' ✎') : null),

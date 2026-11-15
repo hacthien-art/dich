@@ -1,17 +1,18 @@
 // Điều khiển chính của app
-import { h, clear, toast, modal, confirmBox, download, readFileBytes, fmtTime } from './ui/dom.js';
+import { h, clear, toast, modal, confirmBox, download, readFileBytes, fmtTime, pickFile } from './ui/dom.js';
 import { store, safeId } from './ui/store.js';
 import { parseCardFile } from './core/card.js';
 import { DEFAULT_PRESET, importPreset } from './core/preset.js';
 import { runTranslation, suggestDict, resolveConflicts } from './core/translate.js';
 import { Project, DEFAULT_TRANSLATE_SETTINGS } from './project.js';
-import { uuid, debounce, deepClone } from './core/util.js';
+import { uuid, debounce, deepClone, hasCJK } from './core/util.js';
 import * as TabConnect from './ui/tab-connect.js';
 import * as TabPreset from './ui/tab-preset.js';
 import * as TabCard from './ui/tab-card.js';
 import * as TabVars from './ui/tab-vars.js';
 import * as TabPreview from './ui/tab-preview.js';
 import * as TabSettings from './ui/tab-settings.js';
+import * as TabCheck from './ui/tab-check.js';
 import * as TabLog from './ui/tab-log.js';
 import { createUpdater } from './ui/update.js';
 
@@ -80,7 +81,7 @@ async function boot() {
 
   await loadPresets();
 
-  const tabDefs = { connect: TabConnect, preset: TabPreset, card: TabCard, vars: TabVars, preview: TabPreview, settings: TabSettings, log: TabLog };
+  const tabDefs = { connect: TabConnect, preset: TabPreset, card: TabCard, vars: TabVars, preview: TabPreview, check: TabCheck, settings: TabSettings, log: TabLog };
   for (const [name, mod] of Object.entries(tabDefs)) {
     const el = document.getElementById('tab-' + name);
     app.tabs[name] = mod.create(app, el);
@@ -130,6 +131,7 @@ function bindChrome() {
   const fileInp = document.getElementById('fileCard');
   document.getElementById('btnImport').addEventListener('click', () => { fileInp.value = ''; fileInp.click(); });
   fileInp.addEventListener('change', () => { if (fileInp.files[0]) importFile(fileInp.files[0]); });
+  document.getElementById('btnUpdateCard').addEventListener('click', () => updateCardDialog());
   document.getElementById('btnTranslateAll').addEventListener('click', () => translateAll());
   document.getElementById('btnRetry').addEventListener('click', () => translateAll(null, { problems: true }));
   document.getElementById('btnStop').addEventListener('click', () => stopRun());
@@ -171,6 +173,22 @@ export async function importFile(file) {
       if (looksPreset && !looksCard) { await importPresetObject(j, file.name); return; }
     }
     const card = parseCardFile(file.name, bytes);
+    // card trùng tên với một dự án đã dịch -> hỏi có muốn CẬP NHẬT dự án đó (giữ bản dịch) thay vì dịch lại từ đầu
+    const cardName = card.raw.data?.name || '';
+    const same = cardName ? await findProjectsByCard(cardName) : [];
+    if (same.length) {
+      const target = same[0];
+      const choice = await modal('Card này đã có dự án dịch', h('div', null,
+        h('p', null, `Card "${cardName}" trùng tên với dự án `, h('b', null, target.name || target.id), target.updatedAt ? ` (sửa lần cuối ${fmtTime(target.updatedAt)})` : '', '.'),
+        h('p', { class: 'muted small' }, 'Cập nhật dự án: thay card gốc bằng file mới nhưng GIỮ toàn bộ bản dịch, từ điển biến, chỉnh tay — chỉ phần nội dung mới / bị sửa mới cần dịch. Tạo dự án mới: dịch lại từ đầu.')),
+      [{ label: 'Hủy', value: null }, { label: 'Tạo dự án mới', value: 'new' }, { label: '🔄 Cập nhật dự án cũ', cls: 'primary', value: 'update' }]);
+      if (!choice) return;
+      if (choice === 'update') {
+        if (app.project?.id !== target.id) await openProject(target.id, true);
+        await applyCardUpdate(card);
+        return;
+      }
+    }
     if (app.project?.dirty) await saveProjectNow();
     const p = Project.fromFile(card, file.name);
     p.rescan(app.ts());
@@ -187,6 +205,76 @@ export async function importFile(file) {
     console.error(e);
     toast('Không nhập được file: ' + e.message, 'err', 7000);
   }
+}
+
+// ====================================================================== cập nhật card (giữ bản dịch)
+/** Các dự án đã lưu có cùng tên card (dùng chỉ mục nhỏ trong cài đặt, không phải đọc từng dự án) */
+async function findProjectsByCard(cardName) {
+  const index = app.settings.projectIndex || {};
+  let ids = [];
+  try { ids = (await store.list('projects')).map((x) => x.id); } catch { return []; }
+  const alive = new Set(ids);
+  for (const id of Object.keys(index)) if (!alive.has(id)) delete index[id];
+  const out = Object.entries(index).filter(([, v]) => v.cardName === cardName).map(([id, v]) => ({ id, ...v }));
+  if (app.project && app.project.cardName === cardName && !out.some((x) => x.id === app.project.id)) out.unshift({ id: app.project.id, name: app.project.name, cardName, updatedAt: app.project.data.updatedAt });
+  return out.sort((a, b) => (b.id === app.project?.id) - (a.id === app.project?.id) || (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+/** Nút "🔄 Cập nhật card": chọn file phiên bản mới của card đang mở */
+export async function updateCardDialog() {
+  const p = app.project;
+  if (!p) return toast('Hãy mở dự án (card) cần cập nhật trước', 'warn');
+  if (app.running) return toast('Đang dịch — hãy đợi xong hoặc bấm Dừng', 'warn');
+  const file = await pickFile('.png,.json,image/png,application/json');
+  if (!file) return;
+  try {
+    const card = parseCardFile(file.name, await readFileBytes(file));
+    const newName = card.raw.data?.name || '';
+    if (newName && p.cardName && newName !== p.cardName && !(await confirmBox(`Card mới tên "${newName}" khác card đang mở "${p.cardName}".\nVẫn cập nhật dự án này bằng file đó?`, 'Vẫn cập nhật'))) return;
+    await applyCardUpdate(card);
+  } catch (e) {
+    console.error(e);
+    toast('Không cập nhật được card: ' + e.message, 'err', 8000);
+  }
+}
+app.updateCardDialog = updateCardDialog;
+
+async function applyCardUpdate(card) {
+  const p = app.project;
+  const ts = app.ts();
+  const { stats, undo } = p.updateCard(card, ts);
+  await saveProjectNow();
+  app.refreshAll();
+  const s = stats;
+  app.log(`Cập nhật card từ ${s.fileName}: ${s.items.same} mục giữ nguyên, ${s.items.changed.length} mục sửa, ${s.items.added.length} mục mới, ${s.items.removed.length} mục bị xóa; dùng lại ${s.segs.done}/${s.segs.total} đoạn đã dịch, còn ${s.segs.todo} đoạn mới`, 'ok');
+  const list = (title, arr) => (arr.length ? h('details', null, h('summary', { class: 'small' }, `${title} (${arr.length})`), h('ul', { class: 'small' }, arr.slice(0, 80).map((x) => h('li', null, x)), arr.length > 80 ? h('li', { class: 'muted' }, `… và ${arr.length - 80} mục khác`) : null)) : null);
+  const body = h('div', null,
+    s.similarity < 0.3 ? h('div', { class: 'card-box tight warn small' }, `⚠ Chỉ ${Math.round(s.similarity * 100)}% mục của file mới khớp với card cũ — có thể bạn chọn nhầm card khác. Bấm "Hoàn tác" nếu không đúng.`) : null,
+    h('div', { class: 'stats', style: { marginBottom: '10px' } },
+      h('span', { class: 'pill ok' }, `${s.items.same} mục không đổi`),
+      h('span', { class: 'pill warn' }, `${s.items.changed.length} mục bị sửa`),
+      h('span', { class: 'pill' }, `${s.items.added.length} mục mới`),
+      h('span', { class: 'pill' }, `${s.items.removed.length} mục bị xóa`)),
+    h('p', null, h('b', null, `Đã dùng lại ${s.segs.done}/${s.segs.total} đoạn dịch`),
+      ` — ${s.segs.exact} đoạn y hệt bản cũ` + (s.segs.composed ? `, ${s.segs.composed} đoạn ghép lại từ các đoạn văn/dòng đã dịch` : '') + (s.segs.legacy ? `, ${s.segs.legacy} đoạn chuyển từ khóa cũ` : '') + '.'),
+    s.segs.todo ? h('p', null, `Còn `, h('b', null, `${s.segs.todo} đoạn mới / bị sửa`), ` cần dịch — chỉ gửi AI ~${s.segs.todoChars} ký tự` + (s.segs.parts ? ` (với đoạn dài chỉ bị sửa vài dòng, chỉ dịch ${s.segs.parts} khối dòng mới rồi ghép với bản dịch cũ)` : '') + '.') : h('p', { class: 'ok' }, 'Không có đoạn nào cần dịch thêm ✓'),
+    h('p', { class: 'small muted' }, `Từ điển: ${s.dict.total} mục (${s.dict.added} mục mới, ${s.dict.removed} mục không còn dùng — được cất lại để dùng nếu xuất hiện lại)` + (s.dict.needTranslation ? `, ${s.dict.needTranslation} mục chưa có bản dịch.` : '.') +
+      (s.overrides.kept ? ` Giữ ${s.overrides.kept} chỉnh tay.` : '')),
+    s.overrides.dropped.length ? h('div', { class: 'card-box tight warn small' }, `${s.overrides.dropped.length} mục có chỉnh tay nhưng nội dung gốc đã bị tác giả sửa nên chỉnh tay không được áp dụng (đã lưu lại trong dự án): ${s.overrides.dropped.slice(0, 6).join(' · ')}`) : null,
+    list('Mục bị sửa', s.items.changed), list('Mục mới', s.items.added), list('Mục bị xóa', s.items.removed));
+  const actions = [{ label: '↶ Hoàn tác', value: 'undo' }, { label: 'Đóng', value: 'close' }];
+  if (s.segs.todo || s.dict.needTranslation) actions.push({ label: `▶ Dịch phần mới (${s.segs.todo} đoạn)`, cls: 'primary', value: 'translate' });
+  const choice = await modal(`Đã cập nhật card: ${p.cardName}`, body, actions, { wide: true });
+  if (choice === 'undo') {
+    undo();
+    await saveProjectNow();
+    app.refreshAll();
+    toast('Đã hoàn tác — dự án trở về card cũ', 'ok');
+    app.log('Hoàn tác cập nhật card', 'warn');
+    return;
+  }
+  showTab('card');
+  if (choice === 'translate') translateAll();
 }
 
 export async function importPresetObject(json, fileName) {
@@ -220,6 +308,11 @@ async function saveProjectNow() {
   try {
     await store.put('projects', p.id, p.toJSON());
     p.dirty = false;
+    // chỉ mục nhỏ (tên dự án / tên card) để nhận ra card đã từng dịch khi nhập lại bản cập nhật
+    const index = (app.settings.projectIndex ||= {});
+    const prev = index[p.id];
+    if (!prev || prev.name !== p.name || prev.cardName !== p.cardName) { index[p.id] = { name: p.name, cardName: p.cardName, updatedAt: p.data.updatedAt }; app.saveSettings(); }
+    else prev.updatedAt = p.data.updatedAt;
   } catch (e) { toast('Lưu dự án lỗi: ' + e.message, 'err'); }
 }
 app.saveProjectNow = saveProjectNow;
@@ -234,8 +327,20 @@ async function openProject(id, silent) {
   app.settings.lastProject = id;
   app.saveSettings();
   if (!silent) toast('Đã mở dự án: ' + p.name, 'ok');
+  // dự án dịch bằng bản cũ: báo những gì đã được tự sửa khi mở
+  const r = p.lastRepair || {};
+  const fixed = [];
+  if (r.tmTags || r.dictTags) fixed.push(`gỡ nhãn [biến]/[giá trị] lọt vào ${r.tmTags || 0} đoạn dịch và ${r.dictTags || 0} mục từ điển`);
+  if (r.legacy || r.composed) fixed.push(`chuyển ${(r.legacy || 0) + (r.composed || 0)} bản dịch cũ sang cách phân tích mới`);
+  if (fixed.length) {
+    app.log('Tự sửa dự án khi mở: ' + fixed.join('; '), 'ok');
+    toast('Đã tự sửa dự án cũ: ' + fixed.join('; ') + '. Xem tab 🩺 Kiểm tra để rà lại.', 'info', 9000);
+    p.dirty = true;
+    saveProjectNow();
+  }
   app.refreshAll();
 }
+app.openProject = openProject;
 
 async function projectsDialog() {
   let items = [];
@@ -356,7 +461,8 @@ export async function translateAll(itemIds, { force = false, problems = false } 
   const t0 = Date.now();
   try {
     if (ts.autoSuggestDict && !itemIds) {
-      const need = Object.entries(p.data.dict).filter(([, v]) => !v.dst && !v.keep && needsDict(v.kind, ts)).map(([src, v]) => ({ src, kind: v.kind, parents: v.parents }));
+      // mục chưa dịch + mục AI gợi ý trước đây mà vẫn còn chữ Hán (không tính mục người dùng sửa tay)
+      const need = Object.entries(p.data.dict).filter(([, v]) => (!v.dst || (!v.manual && hasCJK(v.dst))) && !v.keep && needsDict(v.kind, ts)).map(([src, v]) => ({ src, kind: v.kind, parents: v.parents }));
       if (need.length) {
         app.log(`Bước 1: gợi ý ${need.length} mục từ điển (biến, giá trị, nhãn, thuật ngữ)`, 'info');
         await runDictSuggest(need);
@@ -376,11 +482,20 @@ export async function translateAll(itemIds, { force = false, problems = false } 
     const notes = new Map();
     for (const s of todo) if (p.data.warnings[s.key]) notes.set(s.key, p.data.warnings[s.key]);
     if (!todo.length) { toast(problems ? 'Không còn đoạn nào chưa dịch hoặc bị lỗi ✓' : 'Đã dịch hết ✓', 'ok'); return; }
-    app.log(`Bước 2: dịch ${todo.length} đoạn${problems ? ` (gồm ${notes.size} đoạn lỗi/cảnh báo)` : ''} (${todo.reduce((n, s) => n + s.key.length, 0)} ký tự)`, 'info');
+    // card được cập nhật: đoạn dài chỉ bị sửa/thêm vài dòng -> chỉ gửi AI các dòng mới rồi ghép với bản dịch cũ
+    let send = todo, delta = null;
+    if (!force) {
+      delta = p.deltaPlan(todo.filter((s) => !p.tm.has(s.key)));
+      if (delta.parts) {
+        send = [...todo.filter((s) => p.tm.has(s.key)), ...delta.send];
+        app.log(`Chỉ dịch phần thay đổi: ${delta.parts} khối dòng mới thay cho việc dịch lại cả đoạn dài (bớt ~${delta.savedChars} ký tự)`, 'info');
+      }
+    }
+    app.log(`Bước 2: dịch ${send.length} đoạn${problems ? ` (gồm ${notes.size} đoạn lỗi/cảnh báo)` : ''} (${send.reduce((n, s) => n + s.key.length, 0)} ký tự)`, 'info');
     let lastRefresh = 0;
     const res = await runTranslation({
-      segments: todo, tm: new Map(p.tm), settings: ts, conn, preset: app.preset.data, dict: p.data.dict, cardName: p.cardName,
-      glossary: p.data.glossary, signal: ac.signal, force: problems, notes,
+      segments: send, tm: new Map(p.tm), settings: ts, conn, preset: app.preset.data, dict: p.data.dict, cardName: p.cardName,
+      glossary: p.data.glossary, guard: p.guard, signal: ac.signal, force: problems, notes,
       onResult: (key, text, warn) => {
         p.setTranslation(key, text, warn);
         app.saveProject();
@@ -392,12 +507,27 @@ export async function translateAll(itemIds, { force = false, problems = false } 
       onStream: (wid, t) => app.tabs.log?.stream?.(wid, t),
     });
     const secs = ((Date.now() - t0) / 1000).toFixed(0);
-    if (res.aborted) toast('Đã dừng dịch', 'warn');
+    // ghép bản dịch các khối dòng mới với phần đã dịch -> đoạn dài hoàn chỉnh
+    if (delta?.parts) {
+      const r = p.reuseTranslations();
+      if (r.composed) app.log(`Đã ghép ${r.composed} đoạn từ phần dịch mới + bản dịch cũ`, 'ok');
+      const left = todo.filter((s) => !p.tm.has(s.key)).length;
+      if (left && !res.aborted) app.log(`${left} đoạn chưa ghép được (khối dòng mới bị lỗi) — bấm "🔁 Dịch chỗ thiếu/lỗi" để dịch lại nguyên đoạn`, 'warn');
+    }
     const warned = todo.filter((s) => p.data.warnings[s.key]).length;
     if (res.aborted) toast('Đã dừng dịch', 'warn');
     else if (res.failed || warned) toast(`Xong: ${res.failed} đoạn lỗi, ${warned} đoạn còn cảnh báo (${secs}s). Bấm "🔁 Dịch chỗ thiếu/lỗi" để thử lại riêng các đoạn này.`, 'warn', 9000);
     else toast(`Dịch xong ${res.done} đoạn trong ${secs}s ✓`, 'ok', 6000);
     app.log(`Hoàn tất: ${res.done} xong, ${res.failed} lỗi, ${warned} cảnh báo, ${secs}s`, res.failed || warned ? 'warn' : 'ok');
+    // kiểm tra tổng thể ngay sau khi dịch (chữ Hán sót, EJS, đồng bộ biến, regex) — chi tiết ở tab Kiểm tra
+    if (!res.aborted && !itemIds) {
+      try {
+        const rep = p.check(ts, { deadlineMs: 4000 });
+        app.tabs.check?.setReport?.(rep);
+        const bad = rep.sections.filter((s) => s.level === 'error' || s.level === 'warn');
+        app.log('Kiểm tra sau dịch: ' + (bad.length ? bad.map((s) => `${s.title}: ${s.summary}`).join(' | ') : 'không phát hiện vấn đề ✓'), bad.some((s) => s.level === 'error') ? 'error' : bad.length ? 'warn' : 'ok');
+      } catch (e) { console.error('check', e); }
+    }
   } catch (e) {
     console.error(e);
     toast('Lỗi dịch: ' + e.message, 'err', 9000);
@@ -427,6 +557,7 @@ export function updateTopbar() {
   const p = app.project;
   document.getElementById('projectName').textContent = p ? p.name : '(chưa mở card)';
   document.getElementById('btnTranslateAll').disabled = !p || !!app.running;
+  document.getElementById('btnUpdateCard').disabled = !p || !!app.running;
   document.getElementById('btnExport').disabled = !p;
   document.getElementById('btnStop').hidden = !app.running;
   const retry = document.getElementById('btnRetry');
@@ -470,6 +601,11 @@ async function exportCard(type) {
   const notes = [];
   if (st.done < st.total) notes.push(`• Còn ${st.total - st.done}/${st.total} đoạn chưa dịch (sẽ giữ nguyên tiếng Trung).`);
   if (conflicts.length) notes.push(`• Có ${conflicts.length} xung đột tên biến (2 biến khác nhau trùng tên mới) — xem tab Biến & Đồng bộ.`);
+  try {
+    const rep = p.check(ts, { deadlineMs: 3000 });
+    app.tabs.check?.setReport?.(rep);
+    for (const s of rep.sections) if (s.level === 'error' && s.id !== 'dict') notes.push(`• ${s.title}: ${s.summary} — xem tab 🩺 Kiểm tra.`);
+  } catch (e) { console.error('check', e); }
   if (notes.length && !(await confirmBox('Lưu ý trước khi xuất:\n' + notes.join('\n') + '\n\nVẫn xuất card?', 'Xuất'))) return;
   try {
     const name = (p.buildCard(ts).data?.name || p.cardName || 'card').replace(/[\\/:*?"<>|]+/g, '_');
