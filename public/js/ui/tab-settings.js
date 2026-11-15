@@ -31,6 +31,7 @@ export function create(app, el) {
       checkbox('Dùng các prompt đang bật của preset ST (preset phá giới hạn)', !!ts.usePresetPrompts, (v) => { ts.usePresetPrompts = v; save(); }),
       checkbox('Dùng Assistant Prefill của preset cho mọi API (không chỉ Claude)', !!ts.applyPrefill, (v) => { ts.applyPrefill = v; save(); }),
       checkbox('Tự gợi ý bảng biến/thuật ngữ bằng AI trước khi dịch toàn bộ', !!ts.autoSuggestDict, (v) => { ts.autoSuggestDict = v; save(); }),
+      checkbox('Tự dịch lại các biến bị trùng tên (2 biến khác nhau bị dịch thành cùng một tên)', ts.autoFixConflicts !== false, (v) => { ts.autoFixConflicts = v; save(); }, 'Chạy sau bước gợi ý từ điển và trước khi dịch. AI đặt lại tên cho đủ nghĩa để phân biệt; nếu vẫn trùng thì thêm hậu tố số.'),
     );
 
     const scope = h('div', { class: 'card-box' },
@@ -46,8 +47,8 @@ export function create(app, el) {
         h('div', null,
           field('Từ khóa kích hoạt lorebook (keys)', select({ append: 'Giữ từ khóa gốc + thêm bản dịch (khuyên dùng)', replace: 'Thay bằng bản dịch', keep: 'Giữ nguyên' }, ts.keysMode, (v) => { ts.keysMode = v; save(); app.project?.bump(); })),
           field('Chuỗi tiếng Trung trong mã JS (HTML/script)', select({ smart: 'Thông minh — dịch chữ hiển thị, giữ chuỗi dùng làm khóa/so sánh', all: 'Dịch mọi chuỗi (trừ biến đã đồng bộ)', none: 'Không dịch chuỗi trong mã' }, ts.codeStrings, (v) => { ts.codeStrings = v; reanalyze(); })),
-          checkbox('Dịch cả chuỗi trong mã EJS (<% %>) — mặc định chỉ đồng bộ biến', !!ts.ejsStrings, (v) => { ts.ejsStrings = v; reanalyze(); }),
-          checkbox('Dịch chú thích trong mã (<!-- -->, //, /* */)', !!ts.comments, (v) => { ts.comments = v; reanalyze(); }),
+          checkbox('Dịch cả chuỗi trong mã EJS (<% %>) — mặc định chỉ đồng bộ biến', !!ts.ejsStrings, (v) => { ts.ejsStrings = v; reanalyze(); }, 'Mặc định: chuỗi trong thẻ xuất <%= %> / <%- %> và print() được dịch; chuỗi trong thẻ mã <% %> giữ nguyên (thường là điều kiện so sánh, tên mục lorebook ghép động). Bật nếu card chỉ dùng EJS để hiển thị chữ.'),
+          checkbox('Dịch chú thích trong mã (<!-- -->, //, /* */, <%# %>)', !!ts.comments, (v) => { ts.comments = v; reanalyze(); }, 'Chú thích không ảnh hưởng chạy mã; bản dịch được ép trên 1 dòng với // và không thể đóng chú thích sớm.'),
         ),
       ),
     );
@@ -68,7 +69,21 @@ export function create(app, el) {
       promptEditor('dict', 'Gợi ý tên biến / thuật ngữ', 'Biến: {{card_name}}, {{name_rule}}, {{items}} (các thẻ <item>). Kết quả phải trả về thẻ <item id="...">.'),
     );
 
-    el.append(h('h2', null, '⚙️ Cài đặt dịch'), run, scope, prompts,
+    const updOut = h('span', { class: 'muted small' });
+    const updBtn = h('button', { class: 'btn', onclick: async () => {
+      updBtn.disabled = true; updOut.textContent = 'Đang hỏi GitHub…';
+      try {
+        const r = await app.updater.check(true, { silent: false });
+        updOut.textContent = r?.error ? '✗ ' + r.error : r?.available ? `Có bản mới (${r.commits?.length || r.behind || 1} thay đổi)` : '✓ Đang dùng bản mới nhất';
+      } finally { updBtn.disabled = false; }
+    } }, '🔄 Kiểm tra cập nhật');
+    const upd = h('div', { class: 'card-box' },
+      h('h3', { style: { marginTop: 0 } }, 'Cập nhật ứng dụng'),
+      h('div', { class: 'row' }, h('span', { class: 'pill' }, 'Phiên bản: v' + (app.version || '?')), updBtn, updOut),
+      checkbox('Tự kiểm tra bản mới trên GitHub khi mở app (nút "⬆ Cập nhật" hiện trên thanh trên cùng khi có bản mới)', app.settings.autoUpdateCheck !== false, (v) => { app.settings.autoUpdateCheck = v; save(); }),
+      h('div', { class: 'hint muted small' }, 'Cài bằng git clone: app chạy git fetch + git merge --ff-only. Cài bằng file zip: app tải zip nhánh main và chép đè (thư mục data/ được giữ nguyên). Sau khi cập nhật, app tự khởi động lại.'));
+
+    el.append(h('h2', null, '⚙️ Cài đặt dịch'), run, scope, prompts, upd,
       h('button', { class: 'btn', onclick: () => { Object.assign(ts, { ...DEFAULT_TRANSLATE_SETTINGS, prompts: ts.prompts }); reanalyze(); render(); toast('Đã đặt lại thông số (giữ prompt)', 'ok'); } }, '↺ Đặt lại thông số mặc định'));
   }
   return self;

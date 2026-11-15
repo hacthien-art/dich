@@ -19,6 +19,42 @@ export function isShortValue(s) {
   return typeof s === 'string' && hasCJK(s) && s.length <= 24 && !/[\n，。！？；…]|[.!?;]\s/.test(s);
 }
 
+/**
+ * Giá trị ghép từ nhiều nhãn, vd "权势、高知、舆论" (mã JS hay tách bằng split(/[、,，]/) rồi tra từng nhãn).
+ * Trả về các phần nếu là danh sách nhãn ngắn ngăn bằng 、, ngược lại null.
+ */
+export function compositeParts(s) {
+  if (typeof s !== 'string' || !s.includes('、') || s.length > 120 || /[\n。！？；…]/.test(s)) return null;
+  const parts = s.split('、').map((x) => x.trim());
+  if (parts.length < 2 || parts.some((x) => !x)) return null;
+  return parts.every((x) => isShortValue(x) && x.length <= 16) ? parts : null;
+}
+
+/**
+ * Tách chuỗi ghép để render: [{ text, sep }] — chỉ khi mọi phần (đã trim) đều có trong từ điển.
+ * Dấu phân cách (、 ， , ／ / | ；) và khoảng trắng được giữ nguyên để mã tách nhãn vẫn chạy.
+ */
+export function splitCompositeKnown(s, has) {
+  if (typeof s !== 'string' || !hasCJK(s) || s.length > 200 || /\n/.test(s)) return null;
+  const re = /\s*(?:、|，|,|；|;|／|\/|\|)\s*/g;
+  const out = [];
+  let pos = 0, m;
+  while ((m = re.exec(s))) {
+    if (!m[0]) { re.lastIndex++; continue; }
+    out.push({ text: s.slice(pos, m.index), sep: m[0] });
+    pos = m.index + m[0].length;
+  }
+  out.push({ text: s.slice(pos), sep: '' });
+  if (out.length < 2 || out.some((p) => !p.text)) return null;
+  let known = 0;
+  for (const p of out) {
+    if (!hasCJK(p.text)) continue;
+    if (!has(p.text)) return null;
+    known++;
+  }
+  return known ? out : null;
+}
+
 /** Tạo bộ quét */
 class Scanner {
   constructor() { this.map = new Map(); this.initVars = []; this.schemas = []; this.warnings = []; }
@@ -34,11 +70,18 @@ class Scanner {
     if (sample && e.samples.length < 3 && !e.samples.includes(sample)) e.samples.push(sample);
   }
 
+  /** Thêm giá trị dữ liệu; giá trị ghép "A、B、C" -> thêm từng nhãn (không thêm cả chuỗi) để mọi nơi dịch nhất quán */
+  addValue(v, parent, sample) {
+    const parts = compositeParts(v);
+    if (parts) { for (const x of parts) this.add(x, 'value', parent, sample); return; }
+    if (isShortValue(v)) this.add(v, 'value', parent, sample);
+  }
+
   walkData(v, path) {
     if (Array.isArray(v)) {
       // MVU cũ: [giá trị, "mô tả"]
       if (v.length === 2 && typeof v[1] === 'string' && !isShortValue(v[1]) && typeof v[0] !== 'object') {
-        if (isShortValue(v[0])) this.add(v[0], 'value', path.join('.'), path.join('.'));
+        this.addValue(v[0], path.join('.'), path.join('.'));
         return;
       }
       v.forEach((x) => this.walkData(x, path));
@@ -51,7 +94,7 @@ class Scanner {
       }
       return;
     }
-    if (isShortValue(v)) this.add(v, 'value', path.join('.'), path.join('.'));
+    this.addValue(v, path.join('.'), path.join('.'));
   }
 
   scanSchema(code, label) {
@@ -89,7 +132,7 @@ class Scanner {
         if (isDescribe) continue;
         if (inObj && prev?.type === 'punct' && (prev.value === '{' || prev.value === ',') && next?.value === ':') { this.add(s, 'key', parentPath, label); continue; }
         if (prev?.value === '[' && next?.value === ']' && (sig[i - 2]?.type === 'ident' || [')', ']'].includes(sig[i - 2]?.value))) { this.add(s, 'key', null, label); continue; }
-        if (isShortValue(s)) this.add(s, 'value', parentPath, label);
+        this.addValue(s, parentPath, label);
       }
     }
   }
@@ -101,7 +144,8 @@ class Scanner {
       const segs = p.replace(/\[\s*['"]([^'"\]]+)['"]\s*\]/g, '.$1').replace(/\[\d+\]/g, '').split(/[./]/).filter(Boolean);
       let parent = '';
       for (const s of segs) {
-        if (/^(stat_data|display_data|delta_data)$/.test(s) || /^\$\{.*\}$/.test(s) || /^<.*>$/.test(s) || /^\d+$/.test(s) || s === '-' || s === '*') { parent = parent ? parent + '.' + s : ''; continue; }
+        if (/^\$\{.*\}$/.test(s)) { this.addPlaceholder(s, parent, label); parent = parent ? parent + '.' + s : ''; continue; }
+        if (/^(stat_data|display_data|delta_data)$/.test(s) || /^<.*>$/.test(s) || /^\d+$/.test(s) || s === '-' || s === '*') { parent = parent ? parent + '.' + s : ''; continue; }
         if (hasCJK(s) && s.length <= 40 && !/[\s，。：:（）()!！?？、]/.test(s)) this.add(s, 'key', parent || null, label);
         parent = parent ? parent + '.' + s : s;
       }
@@ -114,6 +158,34 @@ class Scanner {
     while ((m = re3.exec(text))) addPath(m[1].trim().replace(/^stat_data\./, ''));
     const re4 = /["']?(?:path|from)["']?\s*:\s*["'](\/[^"'\n]+)["']/g;
     while ((m = re4.exec(text))) addPath(m[1]);
+  }
+
+  /** ${角色名} / ${外貌|性格|背景}: chỗ giữ chỗ khóa trong quy tắc cập nhật MVU -> thêm từng khóa thay thế */
+  addPlaceholder(seg, parent, label) {
+    const inner = seg.slice(2, -1);
+    if (!hasCJK(inner) || inner.length > 120) return;
+    for (const alt of inner.split('|')) {
+      const a = alt.trim();
+      if (hasCJK(a) && a.length <= 20 && !/[\s.\/\[\]'"`{}()（），。：:、=+*!?]/.test(a)) this.add(a, 'key', parent || null, label);
+    }
+  }
+
+  /** Đường dẫn trần có ${…} trong văn bản (vd "冒险者队伍.${外貌|性格|背景}:" trong [mvu_update]) */
+  scanPlaceholders(text, label) {
+    if (!text || !text.includes('${') || !hasCJK(text)) return;
+    const re = /(?:\$\{[^{}\n]*\}|[^\s.,;:'"`()\[\]{}<>，。；：！？、]+)(?:\.(?:\$\{[^{}\n]*\}|[^\s.,;:'"`()\[\]{}<>，。；：！？、]+))+/g;
+    let m;
+    while ((m = re.exec(text))) {
+      if (!m[0].includes('${') || !hasCJK(m[0])) continue;
+      const segs = m[0].split(/\.(?![^{]*\})/);
+      // ít nhất một đoạn là khóa đã biết (tránh nhầm với mã JS)
+      if (!segs.some((s) => !s.startsWith('${') && this.map.get(s)?.kind === 'key')) continue;
+      let parent = '';
+      for (const s of segs) {
+        if (s.startsWith('${') && s.endsWith('}')) this.addPlaceholder(s, parent, label);
+        parent = parent ? parent + '.' + s : s;
+      }
+    }
   }
 
   scanComparisons(text, label) {
@@ -169,11 +241,17 @@ export function scanCard(card, items) {
   for (const it of items) {
     if (it.kind === 'schema') { sc.schemas.push({ itemId: it.id, title: it.meta?.title }); sc.scanSchema(it.text, it.meta?.title || 'schema'); }
   }
+  // 2b) dữ liệu Tavern Helper (biến nhân vật, data của script) + tên nút script được chính script lắng nghe
+  for (const it of items) {
+    if (it.kind === 'json') { try { sc.walkData(JSON.parse(it.text), [it.meta?.root || 'tavern_helper']); } catch { /* bỏ qua */ } }
+    else if (it.kind === 'button') sc.add(it.text, 'value', null, it.label);
+  }
   // 3) đường dẫn + so sánh trong mọi văn bản
   for (const it of items) {
-    if (typeof it.text !== 'string') continue;
+    if (typeof it.text !== 'string' || it.kind === 'json' || it.kind === 'button') continue;
     sc.scanPaths(it.text, it.label);
     if (it.kind !== 'initvar') sc.scanComparisons(it.text, it.label);
+    if (it.kind === 'auto' || it.kind === 'initvar') sc.scanPlaceholders(it.text, it.label);
   }
   // 4) marker trong find regex
   for (const it of items) if (it.kind === 'regexFind') sc.scanMarkers(it.text, it.meta?.title);

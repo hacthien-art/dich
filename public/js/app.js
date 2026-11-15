@@ -3,7 +3,7 @@ import { h, clear, toast, modal, confirmBox, download, readFileBytes, fmtTime } 
 import { store, safeId } from './ui/store.js';
 import { parseCardFile } from './core/card.js';
 import { DEFAULT_PRESET, importPreset } from './core/preset.js';
-import { runTranslation, suggestDict } from './core/translate.js';
+import { runTranslation, suggestDict, resolveConflicts } from './core/translate.js';
 import { Project, DEFAULT_TRANSLATE_SETTINGS } from './project.js';
 import { uuid, debounce, deepClone } from './core/util.js';
 import * as TabConnect from './ui/tab-connect.js';
@@ -13,6 +13,7 @@ import * as TabVars from './ui/tab-vars.js';
 import * as TabPreview from './ui/tab-preview.js';
 import * as TabSettings from './ui/tab-settings.js';
 import * as TabLog from './ui/tab-log.js';
+import { createUpdater } from './ui/update.js';
 
 const DEFAULT_CONN = () => ({
   id: uuid(), name: 'Proxy mặc định', provider: 'openai', url: '', key: '', model: '', models: [],
@@ -69,6 +70,8 @@ async function boot() {
   s.activeConnection ||= s.connections[0].id;
   s.translate = { ...DEFAULT_TRANSLATE_SETTINGS, ...(s.translate || {}) };
   s.translate.prompts ||= {};
+  // nâng cấp cài đặt cũ: bản 1.1 dịch cả chú thích trong mã (trước đây tắt -> còn sót nhiều chữ Hán trong regex/script)
+  if ((s.settingsVersion || 1) < 2) { s.translate.comments = true; s.translate.autoFixConflicts = true; s.settingsVersion = 2; }
   app.settings = s;
 
   app.saveSettings = debounce(() => store.put('settings', 'app', app.settings).catch((e) => toast('Lưu cài đặt lỗi: ' + e.message, 'err')), 500);
@@ -87,6 +90,14 @@ async function boot() {
   for (const n of Object.keys(app.tabs)) if (n !== 'connect') app.tabs[n].stale = true;
 
   bindChrome();
+  // cập nhật từ GitHub: hiện phiên bản, tự kiểm tra bản mới (nút "⬆ Cập nhật" chỉ hiện khi có bản mới)
+  app.updater = createUpdater(app);
+  const verEl = document.getElementById('appVersion');
+  fetch('/api/ping', { headers: { 'X-App-Token': document.querySelector('meta[name="app-token"]')?.content || '' } })
+    .then((r) => r.json()).then((j) => { app.version = j.version; verEl.textContent = 'v' + j.version + ' · kiểm tra cập nhật'; }).catch(() => {});
+  verEl.title = 'Bấm để kiểm tra bản mới trên GitHub';
+  verEl.addEventListener('click', () => app.updater.check(true, { silent: false }));
+  if (s.autoUpdateCheck !== false) setTimeout(() => app.updater.check(false), 2500);
   if (s.lastProject) {
     try { await openProject(s.lastProject, true); } catch { /* dự án cũ có thể đã bị xóa */ }
   }
@@ -282,11 +293,54 @@ export async function runDictSuggest(entries) {
       onProgress: ({ done, total }) => setProgress(done, total, 'Gợi ý từ điển'),
       onStream: (wid, t) => app.tabs.log?.stream?.('dict', t),
     }, entries);
+    // gợi ý xong -> tự dịch lại các biến bị trùng tên
+    if (!ac.signal.aborted && app.ts().autoFixConflicts !== false) await fixConflicts({ quiet: true });
   } finally {
     if (own) { app.running = null; updateTopbar(); }
     app.refresh('vars');
   }
 }
+
+/**
+ * Tự sửa xung đột tên biến (2 biến khác nhau trong cùng object cha bị dịch cùng một tên):
+ * nhờ AI đặt lại tên khác nhau, nếu vẫn trùng thì thêm hậu tố số.
+ */
+export async function fixConflicts({ quiet = false } = {}) {
+  const p = app.project;
+  if (!p) return null;
+  const ts = app.ts();
+  const before = p.conflicts(ts);
+  if (!before.length) { if (!quiet) toast('Không có xung đột tên biến ✓', 'ok'); return null; }
+  const conn = app.conn();
+  const useAI = !!(conn.url && conn.model);
+  const ac = app.running || new AbortController();
+  const own = !app.running;
+  if (own) { app.running = ac; updateTopbar(); }
+  setProgress(0, before.length, 'Sửa tên biến trùng');
+  try {
+    const res = await resolveConflicts({
+      settings: ts, conn, preset: app.preset.data, cardName: p.cardName, signal: ac.signal,
+      onLog: (m, l) => app.log(m, l),
+      onStream: (wid, t) => app.tabs.log?.stream?.('conflict', t),
+    }, p.data.dict, { useAI });
+    p.bump(); p.touch(); app.saveProject();
+    for (const r of res.renamed) app.log(`Đổi tên biến ${r.src}: "${r.from}" → "${r.to}"`, 'ok');
+    for (const r of res.suffixed) app.log(`Thêm hậu tố cho biến ${r.src}: "${r.from}" → "${r.to}" (AI vẫn đặt trùng)`, 'warn');
+    const msg = `Đã sửa ${before.length} xung đột tên biến: ` + (useAI ? `AI đặt lại ${res.renamed.length} tên` : 'chưa kết nối AI (tab Kết nối) nên chỉ thêm hậu tố số') + (useAI && res.suffixed.length ? `, thêm hậu tố số cho ${res.suffixed.length} tên` : '') + (res.remaining.length ? ` — còn ${res.remaining.length} xung đột` : ' ✓');
+    if (!quiet || res.remaining.length || res.suffixed.length) toast(msg, res.remaining.length ? 'warn' : 'ok', 7000);
+    app.log(msg, res.remaining.length ? 'warn' : 'ok');
+    return res;
+  } catch (e) {
+    toast('Lỗi khi sửa tên biến trùng: ' + e.message, 'err', 7000);
+    app.log('Lỗi sửa tên biến trùng: ' + e.message, 'error');
+    return null;
+  } finally {
+    if (own) { app.running = null; updateTopbar(); }
+    app.refresh('vars');
+    app.refresh('card');
+  }
+}
+app.fixConflicts = fixConflicts;
 
 /** problems=true: chỉ dịch các đoạn chưa dịch hoặc có lỗi/cảnh báo (vd còn sót chữ Hán) — giữ bản cũ nếu dịch lại thất bại */
 export async function translateAll(itemIds, { force = false, problems = false } = {}) {
@@ -308,6 +362,11 @@ export async function translateAll(itemIds, { force = false, problems = false } 
         await runDictSuggest(need);
         if (ac.signal.aborted) return;
       }
+    }
+    // tên biến bị trùng sẽ làm hỏng dữ liệu MVU -> sửa trước khi dịch
+    if (!itemIds && ts.autoFixConflicts !== false && ts.varMode !== 'keep' && p.conflicts(ts).length) {
+      await fixConflicts({ quiet: true });
+      if (ac.signal.aborted) return;
     }
     p.recheckWarnings(ts);
     const segs = p.segmentsFor(itemIds);
@@ -418,7 +477,7 @@ async function exportCard(type) {
       download(name + '_VI.json', p.exportJson(ts), 'application/json');
     } else {
       const fallback = p.card.image ? null : await placeholderPng(p.buildCard(ts).data?.name || p.cardName);
-      if (!p.card.image) toast('Card gốc là JSON nên dùng ảnh nền tạm. Có thể đổi ảnh trong SillyTavern sau khi nhập.', 'warn', 6000);
+      if (!p.card.image) toast('Card chưa có ảnh nên dùng ảnh tạm. Bấm "🖼 Thêm ảnh" ở trang tóm tắt của tab Card để chọn ảnh riêng.', 'warn', 7000);
       download(name + '_VI.png', p.exportPng(ts, fallback), 'image/png');
     }
     app.log('Đã xuất card ' + type.toUpperCase(), 'ok');

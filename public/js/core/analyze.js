@@ -4,6 +4,7 @@
 // không cần dịch lại: chỉ cần render lại.
 import { lexJs, lexHtml, lexCss, significant, cssPropertyBefore } from './lexer.js';
 import { hasCJK, isIdentifier, escapeRegex, HAN_CLASS } from './util.js';
+import { splitCompositeKnown } from './dict.js';
 
 export const PH_RE = /⟦\s*(\d+)\s*⟧/g;
 export const ph = (n) => `⟦${n}⟧`;
@@ -49,12 +50,26 @@ const attrEsc = (q) => (s) => (q === '"' ? s.replace(/"/g, '&quot;') : q === "'"
 const htmlTextEsc = (s) => s.replace(/<(?=[A-Za-z\/!?])/g, '&lt;');
 const cssEsc = (q) => (s) => s.replace(/\\/g, '\\\\').split(q).join('\\' + q).replace(/\n/g, '\\A ');
 const yamlEsc = (q) => (s) => {
-  if (q === '"') return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  if (q === "'") return s.replace(/'/g, "''");
+  if (q === '"') return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n');
+  if (q === "'") return s.replace(/'/g, "''").replace(/\s*\r?\n\s*/g, ' ');
   return s;
 };
-const yamlPlainEsc = (s) => (YAML_PLAIN_BAD.test(s) || /^(true|false|null|yes|no|on|off|~|[-+]?\d[\d_.eE+-]*)$/i.test(s) ? JSON.stringify(s) : s);
+const yamlPlainEsc = (s) => (YAML_PLAIN_BAD.test(s) || /[\r\n]/.test(s) || /^(true|false|null|yes|no|on|off|~|[-+]?\d[\d_.eE+-]*)$/i.test(s) ? JSON.stringify(s) : s);
+// tên / tiêu đề / dòng chú thích YAML: luôn 1 dòng
+const oneLine = (s) => s.replace(/\s*[\r\n]+\s*/g, ' ');
 const jsonEsc = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+// chú thích: bản dịch không được làm "thoát" khỏi chú thích
+const lineCommentEsc = (s) => s.replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');
+const blockCommentEsc = (s) => s.replace(/\*\//g, '* /');
+const htmlCommentEsc = (s) => s.replace(/--!?>/g, '- ->').replace(/<!--/g, '<!- -');
+// mã bên trong <% %> (EJS / ST-Prompt-Template): "%>" hay "<%" trong chuỗi/chú thích sẽ cắt ngang thẻ EJS
+// -> viết thành "%\>" / "<\%" (trong chuỗi JS vẫn ra đúng "%>" / "<%")
+const ejsCodeEsc = (s) => s.replace(/%>/g, '%\\>').replace(/<%/g, '<\\%');
+const ejsTextEsc = (s) => s.replace(/%>/g, '% >').replace(/<%/g, '< %');
+/** Thẻ EJS điều khiển (<% if … { %>, <%_ … _%>) — không phải thẻ xuất giá trị (<%= / <%-) hay chú thích (<%#) */
+export function isEjsScriptlet(src, start) {
+  return src.startsWith('<%', start) && !/[=\-#%]/.test(src[start + 2] || '');
+}
 
 // ====================================================================== bối cảnh phân tích
 /**
@@ -85,6 +100,21 @@ class Analyzer {
     if (k) return k;
     if (this.entryNames.has(text)) return 'entry';
     if (this.bookNames.has(text)) return 'book';
+    return null;
+  }
+
+  /** Chuỗi ghép "A、B、C" mà mọi nhãn đều có trong từ điển -> hole ánh xạ từng nhãn, giữ dấu phân cách */
+  compositeHole(text) {
+    const parts = splitCompositeKnown(text, (x) => !!this.dict.kindOf(x));
+    return parts ? { type: 'composite', parts, esc: true } : null;
+  }
+
+  /** rep cho chuỗi khớp nguyên văn (từ điển / tên mục / chuỗi ghép / đường dẫn) — null nếu không khớp */
+  exactRep(s, e, text, esc) {
+    const k = this.exactKind(text);
+    if (k) return this.dictRep(s, e, text, k, esc);
+    const comp = this.compositeHole(text);
+    if (comp) return { start: s, end: e, render: (env) => esc(renderHole(comp, env)) };
     return null;
   }
 
@@ -148,14 +178,28 @@ class Analyzer {
     if (s >= e) { this.flushHoles(parent, given); return; }
     const text = src.slice(s, e);
 
-    // 1) khớp nguyên văn với từ điển biến / tên mục
+    // 1) khớp nguyên văn với từ điển biến / tên mục / chuỗi ghép
     if (o.exact !== false && !given.length) {
-      const k = this.exactKind(text);
-      if (k) { parent.reps.push(this.dictRep(s, e, text, k, esc)); return; }
+      const rep = this.exactRep(s, e, text, esc);
+      if (rep) { parent.reps.push(rep); return; }
     }
     // 2) tìm phần cần bảo vệ trong đoạn
     const found = this.findProtections(s, e, o, given);
     const holes = mergeHoles(given, found);
+    // 2b) thẻ EJS điều khiển (<% if (…) { %> … <% } %>) là ranh giới: tách đoạn tại đó để AI không thể
+    //     đảo vị trí lệnh điều khiển (đảo ⟦n⟧ của thẻ inline thì được, đảo lệnh if/else thì hỏng logic)
+    const barriers = holes.filter((h) => isEjsScriptlet(src, h.start));
+    if (barriers.length) {
+      let pos = s;
+      const sub = (a, b) => { if (b > a) this.textRun(parent, a, b, { ...o, holes: given.filter((g) => g.start >= a && g.end <= b) }); };
+      for (const b of barriers) {
+        sub(pos, b.start);
+        this.flushHoles(parent, [b], esc);
+        pos = b.end;
+      }
+      sub(pos, e);
+      return;
+    }
     // phần chữ ngoài hole có CJK?
     let outside = '', pos = s;
     for (const h of holes) { outside += src.slice(pos, h.start); pos = h.end; }
@@ -265,11 +309,20 @@ class Analyzer {
         if (k && k !== 'term') add(a, b, this.dictHole(inner, k));
         else if (this.entryNames.has(inner)) add(a, b, { type: 'entry', src: inner, esc: true });
         else if (this.pathInfo(inner)) add(a, b, this.pathHole(inner));
+        else if (!k) {
+          const comp = this.compositeHole(inner);
+          if (comp && comp.parts.some((p) => hasCJK(p.text) && this.dict.kindOf(p.text) !== 'term')) add(a, b, comp);
+        }
       }
+    }
+    // decorator của ST-Prompt-Template ở đầu dòng: @@generate_before, @@render_after, @@dont_activate…
+    if (text.includes('@@')) {
+      const re = /^([ \t]*)(@@[A-Za-z_][\w:-]*)/gm;
+      while ((m = re.exec(text))) add(m.index + m[1].length, m.index + m[0].length, this.rawHole(s + m.index + m[1].length, s + m.index + m[0].length));
     }
     // đường dẫn trần a.b.c (>=2 đoạn, toàn khóa đã biết)
     if (text.includes('.')) {
-      const re = new RegExp('(?:[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+|\\$\\{[^}]*\\})(?:\\.(?:[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+|\\$\\{[^}]*\\}))+', 'g');
+      const re = new RegExp('(?:\\$\\{[^}]*\\}|[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+)(?:\\.(?:\\$\\{[^}]*\\}|[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+))+', 'g');
       while ((m = re.exec(text))) {
         if (!hasCJK(m[0])) continue;
         // bỏ tiền tố không phải đường dẫn (vd "更新世界.时间" -> chỉ lấy phần khớp từ điển)
@@ -335,15 +388,25 @@ class Analyzer {
   }
 
   // ====================================================================== EJS
+  /**
+   * Thẻ EJS (ST-Prompt-Template): <% mã %>, <%_ _%>, <%= xuất %>, <%- xuất thô %>, <%# chú thích %>, <%% = chữ "<%".
+   * - thẻ xuất (<%= / <%-): chuỗi hiển thị được dịch theo quy tắc "thông minh" (giữ khóa/so sánh/tham số API)
+   * - thẻ mã: chỉ đồng bộ biến/tên mục; chuỗi giữ nguyên (trừ tham số print()), trừ khi bật "Dịch cả chuỗi trong EJS"
+   */
   ejsNode(start, end) {
     const node = new Node(start, end);
     const src = this.src;
+    const mod = src[start + 2];
+    if (mod === '%') return node; // <%% -> chữ "<%" thường
     let a = start + 2;
-    while (a < end && /[_\-=#%]/.test(src[a])) a++;
+    while (a < end && /[_\-=#]/.test(src[a])) a++;
     let b = end - 2;
     while (b > a && /[_\-]/.test(src[b - 1])) b--;
-    if (src[start + 2] === '#') return node; // chú thích EJS
-    this.jsRange(node, a, b, { mode: 'ejs' });
+    if (mod === '#') { // chú thích EJS
+      if (this.opts.comments && hasCJK(src.slice(a, b))) this.textRun(node, a, b, { esc: ejsTextEsc, kind: 'comment' });
+      return node;
+    }
+    this.jsRange(node, a, b, { mode: mod === '=' || mod === '-' ? 'ejs-out' : 'ejs', esc: ejsCodeEsc });
     return node;
   }
 
@@ -397,6 +460,14 @@ class Analyzer {
         continue;
       }
       flush();
+      // văn bản chỉ "nhắc tới" thẻ <style>/<script> (vd "dùng thẻ <style>，không được bỏ sót…"): phần sau không phải mã
+      // -> dấu câu tiếng Trung nằm ngoài chuỗi/chú thích là dấu hiệu chắc chắn -> phân tích lại như HTML thường
+      if (t.type === 'raw' && (t.tag === 'style' || t.tag === 'script') && rawIsProse(src, t.start, t.end, t.tag)) {
+        const inner = masks.filter((k) => k.start >= t.start && k.end <= t.end);
+        inner.forEach((k) => used.add(k));
+        this.htmlRange(parent, t.start, t.end, { ...o, masks: inner });
+        continue;
+      }
       if (t.type === 'raw') {
         if (t.tag === 'script') {
           const typeAttr = (t.attrs || []).find((a) => a.name.toLowerCase() === 'type');
@@ -410,7 +481,8 @@ class Analyzer {
           this.textRun(parent, t.start, t.end, { esc: compose(htmlTextEsc, outerEsc), kind: 'ui', entities: true, regexRefs: o.regexRefs, jsEscapes: o.jsEscapes });
         }
       } else if (t.type === 'comment' && this.opts.comments && hasCJK(src.slice(t.start, t.end))) {
-        this.textRun(parent, t.start + 4, Math.max(t.start + 4, t.end - 3), { esc: outerEsc, kind: 'ui' });
+        const ce = src.startsWith('-->', t.end - 3) && t.end - 3 >= t.start + 4 ? t.end - 3 : t.end;
+        this.textRun(parent, t.start + 4, ce, { esc: compose(htmlCommentEsc, outerEsc), kind: 'comment' });
       }
     }
     flush();
@@ -460,14 +532,27 @@ class Analyzer {
       const tagIsButton = t.lower === 'input' && t.attrs.some((x) => x.name.toLowerCase() === 'type' && /button|submit|reset/i.test(src.slice(x.vStart, x.vEnd)));
       if (TRANSLATE_ATTRS.has(name) || (name === 'value' && tagIsButton)) {
         this.textRun(node, at.vStart, at.vEnd, { holes: inMask, esc, kind: 'ui', entities: true, jsEscapes });
-      } else {
-        // chỉ ánh xạ từ điển (value, data-*...)
-        const text = raw.trim();
-        const k = this.exactKind(text);
-        if (k) { const s0 = at.vStart + raw.indexOf(text); node.reps.push(this.dictRep(s0, s0 + text.length, text, k, esc)); }
-        else if (this.pathInfo(text)) { const s0 = at.vStart + raw.indexOf(text); const hole = this.pathHole(text); node.reps.push({ start: s0, end: s0 + text.length, render: (env) => esc(renderHole(hole, env)) }); }
-        else this.flushHoles(node, [...inMask, ...this.findProtections(at.vStart, at.vEnd, {}, inMask)]);
+        continue;
       }
+      // value, data-*…: trước hết ánh xạ theo từ điển (giá trị/khóa dùng trong mã phải khớp nhau)
+      const text = raw.trim();
+      const s0 = at.vStart + raw.indexOf(text);
+      if (!inMask.length) {
+        const rep = this.exactRep(s0, s0 + text.length, text, esc);
+        if (rep) { node.reps.push(rep); continue; }
+        if (this.pathInfo(text)) { const hole = this.pathHole(text); node.reps.push({ start: s0, end: s0 + text.length, render: (env) => esc(renderHole(hole, env)) }); continue; }
+      }
+      // data-* chứa JSON thô: data-cfg='{"名字":"…"}'
+      if (name.startsWith('data-') && /^[{[]/.test(text) && text.includes('"') && at.quote === "'" && !inMask.length) {
+        this.jsRange(node, at.vStart, at.vEnd, { mode: 'json', esc });
+        continue;
+      }
+      // data-* là câu chữ hiển thị / prompt gửi đi (data-prompt="【开始】# 场景生成指令…", data-close="点击查看 ▶")
+      if (name.startsWith('data-') && looksLikeProseAttr(text)) {
+        this.textRun(node, at.vStart, at.vEnd, { holes: inMask, esc, kind: /\n/.test(text) || text.length > 80 ? 'prose' : 'ui', entities: true, jsEscapes, exact: false });
+        continue;
+      }
+      this.flushHoles(node, [...inMask, ...this.findProtections(at.vStart, at.vEnd, {}, inMask)], esc);
     }
   }
 
@@ -481,32 +566,34 @@ class Analyzer {
           this.textRun(parent, t.cStart, t.cEnd, { esc: compose(cssEsc(t.quote), outerEsc), kind: 'ui', jsEscapes: true, exact: true });
         }
       } else if (t.type === 'comment' && this.opts.comments && hasCJK(src.slice(t.start, t.end))) {
-        this.textRun(parent, t.start + 2, t.end - 2, { esc: outerEsc, kind: 'ui' });
+        const ce = src.startsWith('*/', t.end - 2) && t.end - 2 >= t.start + 2 ? t.end - 2 : t.end;
+        this.textRun(parent, t.start + 2, ce, { esc: compose(blockCommentEsc, outerEsc), kind: 'comment' });
       }
     }
   }
 
   // ====================================================================== JS
-  /** mode: script | attr | ejs | code | schema | json */
+  /** mode: script | attr | ejs | ejs-out | code | schema | json */
   jsRange(parent, start, end, o = {}) {
     const src = this.src;
     const toks = o.tokens || lexJs(src, start, end);
     const sig = significant(toks);
     const outerEsc = o.esc || identity;
     const mode = o.mode || 'script';
-    const braceStack = [];
+    const braceStack = []; // 'obj' | 'class' | false (khối lệnh)
     for (let i = 0; i < sig.length; i++) {
       const t = sig[i];
-      const prev = sig[i - 1], next = sig[i + 1];
+      const prev = sig[i - 1];
       if (t.type === 'punct') {
         if (t.value === '{' || t.value === '${') {
-          let isObj = false;
-          if (mode === 'json') isObj = true;
-          else if (!prev) isObj = false;
-          else if (prev.type === 'punct') isObj = OBJECT_PREV.has(prev.value) && !(prev.value === ')');
-          else if (prev.type === 'ident') isObj = OBJECT_PREV.has(prev.value);
-          if (prev && prev.type === 'punct' && prev.value === '=>') isObj = false;
-          braceStack.push(isObj);
+          let kind = false;
+          if (mode === 'json') kind = 'obj';
+          else if (!prev) kind = false;
+          else if (isClassHead(sig, i)) kind = 'class';
+          else if (prev.type === 'punct') kind = OBJECT_PREV.has(prev.value) && prev.value !== ')' ? 'obj' : false;
+          else if (prev.type === 'ident') kind = OBJECT_PREV.has(prev.value) ? 'obj' : false;
+          if (prev && prev.type === 'punct' && prev.value === '=>') kind = false;
+          braceStack.push(kind);
         } else if (t.value === '}') braceStack.pop();
         continue;
       }
@@ -515,17 +602,49 @@ class Analyzer {
         continue;
       }
       if (t.type === 'str') { this.jsString(parent, sig, i, braceStack, outerEsc, mode); continue; }
-      if (t.type === 'tmpl') { this.jsTemplate(parent, t, outerEsc, mode); continue; }
+      if (t.type === 'tmpl') { this.jsTemplate(parent, t, outerEsc, mode, sig, i); continue; }
       if (t.type === 'regex' && hasCJK(src.slice(t.start, t.end))) {
-        this.warn('Có biểu thức regex chứa tiếng Trung trong mã (không tự dịch được): ' + src.slice(t.start, Math.min(t.end, t.start + 60)));
+        if (this.regexLiteral(parent, t.start, t.end, outerEsc)) {
+          this.warn('Có biểu thức regex chứa tiếng Trung trong mã (không tự dịch được): ' + src.slice(t.start, Math.min(t.end, t.start + 60)));
+        }
       }
     }
     if (this.opts.comments) {
       for (const t of toks) if (t.type === 'comment' && hasCJK(src.slice(t.start, t.end))) {
-        const a = t.start + 2, b = src[t.start + 1] === '*' ? t.end - 2 : t.end;
-        this.textRun(parent, a, Math.max(a, b), { esc: (s) => s.replace(/\*\//g, '* /'), kind: 'ui' });
+        const block = src[t.start + 1] === '*';
+        const a = t.start + 2;
+        const b = block ? (src.startsWith('*/', t.end - 2) && t.end - 2 >= a ? t.end - 2 : t.end) : t.end;
+        this.textRun(parent, a, Math.max(a, b), { esc: compose(block ? blockCommentEsc : lineCommentEsc, outerEsc), kind: 'comment', chunk: block ? undefined : false });
       }
     }
+  }
+
+  /** Regex literal trong mã: ánh xạ các cụm chữ Hán là mục từ điển (nhãn/biến). Trả về true nếu còn chữ Hán không ánh xạ được */
+  regexLiteral(parent, start, end, outerEsc) {
+    const src = this.src;
+    const close = src.lastIndexOf('/', end - 1);
+    if (close <= start) return true;
+    const runRe = new RegExp('[' + HAN_CLASS + '\\u3040-\\u30FF]');
+    let left = false, inClass = false;
+    for (let i = start + 1; i < close;) {
+      const c = src[i];
+      if (c === '\\') { i += 2; continue; }
+      if (inClass) { if (c === ']') inClass = false; else if (runRe.test(c)) left = true; i++; continue; }
+      if (c === '[') { inClass = true; i++; continue; }
+      if (runRe.test(c)) {
+        let j = i;
+        while (j < close && runRe.test(src[j])) j++;
+        const word = src.slice(i, j);
+        const k = this.dict.kindOf(word);
+        if (k === 'marker' || k === 'key' || k === 'value') {
+          const hole = this.dictHole(word, k);
+          parent.reps.push({ start: i, end: j, render: (env) => outerEsc(escapeRegex(renderHole(hole, env))) });
+        } else left = true;
+        i = j; continue;
+      }
+      i++;
+    }
+    return left;
   }
 
   jsIdent(parent, sig, i, braceStack, outerEsc, mode) {
@@ -534,9 +653,9 @@ class Analyzer {
     const k = this.dict.kindOf(t.value);
     if (k !== 'key' && k !== 'value' && k !== 'term') return;
     const prev = sig[i - 1], next = sig[i + 1];
-    const src = this.src;
     const name = t.value;
     const quoteFor = (dst) => (dst.includes("'") ? JSON.stringify(dst) : "'" + dst.replace(/\\/g, '\\\\') + "'");
+    const asKey = (env) => { const dst = lookupDict(env, name); return isIdentifier(dst) ? dst : outerEsc(quoteFor(dst)); };
     // truy cập thành viên: a.名 / a?.名
     if (prev && prev.type === 'punct' && (prev.value === '.' || prev.value === '?.')) {
       const dot = prev.value;
@@ -549,18 +668,41 @@ class Analyzer {
       });
       return;
     }
-    const inObj = braceStack.length && braceStack[braceStack.length - 1];
-    if (inObj && prev && prev.type === 'punct' && (prev.value === '{' || prev.value === ',')) {
-      if (next && next.type === 'punct' && (next.value === ':' || next.value === '(')) {
-        parent.reps.push({ start: t.start, end: t.end, render: (env) => { const dst = lookupDict(env, name); return isIdentifier(dst) ? dst : outerEsc(quoteFor(dst)); } });
+    const top = braceStack.length ? braceStack[braceStack.length - 1] : false;
+    const nv = next && next.type === 'punct' ? next.value : null;
+    // get 名() {} / set 名(v) {} / async 名() {} / static 名 / *名() trong object hoặc class
+    const modifier = prev && ((prev.type === 'ident' && /^(get|set|async|static)$/.test(prev.value)) || (prev.type === 'punct' && prev.value === '*'));
+    if ((top === 'obj' || top === 'class') && modifier && (nv === '(' || (top === 'class' && (nv === '=' || nv === ';')))) {
+      parent.reps.push({ start: t.start, end: t.end, render: asKey });
+      return;
+    }
+    // thành viên class: 名() {} / 名 = 1;
+    if (top === 'class' && (!prev || (prev.type === 'punct' && ['{', '}', ';'].includes(prev.value))) && (nv === '(' || nv === '=' || nv === ';' || nv === '}')) {
+      parent.reps.push({ start: t.start, end: t.end, render: asKey });
+      return;
+    }
+    if (top === 'obj' && prev && prev.type === 'punct' && (prev.value === '{' || prev.value === ',')) {
+      if (nv === ':' || nv === '(') {
+        parent.reps.push({ start: t.start, end: t.end, render: asKey });
         return;
       }
-      if (next && next.type === 'punct' && (next.value === ',' || next.value === '}' || next.value === '=')) {
+      if (nv === ',' || nv === '}' || nv === '=') {
         parent.reps.push({ start: t.start, end: t.end, render: (env) => { const dst = lookupDict(env, name); if (dst === name) return name; return (isIdentifier(dst) ? dst : outerEsc(quoteFor(dst))) + ': ' + name; } });
         return;
       }
     }
-    void src; void mode;
+    void mode;
+  }
+
+  /** Chính sách dịch chuỗi trong mã theo ngữ cảnh: 'smart' | 'all' | 'none' */
+  stringPolicy(mode, sig, i) {
+    if (mode === 'ejs-out') return this.opts.ejsStrings || this.opts.codeStrings !== 'none' ? 'smart' : 'none';
+    if (mode === 'ejs') {
+      if (this.opts.ejsStrings) return 'smart';
+      // <% print('…') %> in ra văn bản -> dịch
+      return enclosingCall(sig, i) === 'print' ? 'smart' : 'none';
+    }
+    return this.opts.codeStrings;
   }
 
   jsString(parent, sig, i, braceStack, outerEsc, mode) {
@@ -572,11 +714,11 @@ class Analyzer {
     const esc = compose(jsEsc(t.quote), outerEsc);
     const jsonMode = mode === 'json';
     const escFor = jsonMode ? compose(jsonEsc, outerEsc) : esc;
-    // chuỗi không có escape -> so khớp nguyên văn
+    // chuỗi không có escape -> so khớp nguyên văn (từ điển / tên mục / chuỗi ghép "A、B" / đường dẫn)
     const plain = !content.includes('\\');
     if (plain) {
-      const k = this.exactKind(content);
-      if (k) { parent.reps.push(this.dictRep(t.cStart, t.cEnd, content, k, escFor)); return; }
+      const rep = this.exactRep(t.cStart, t.cEnd, content, escFor);
+      if (rep) { parent.reps.push(rep); return; }
       if (this.pathInfo(content)) { const hole = this.pathHole(content); parent.reps.push({ start: t.cStart, end: t.cEnd, render: (env) => escFor(renderHole(hole, env)) }); return; }
     }
     // .describe('...') trong schema -> mô tả cho AI, dịch
@@ -590,9 +732,12 @@ class Analyzer {
       this.textRun(parent, t.cStart, t.cEnd, { esc: escFor, kind: 'prose', jsEscapes: true });
       return;
     }
-    const policy = mode === 'ejs' ? (this.opts.ejsStrings ? 'smart' : 'none') : this.opts.codeStrings;
-    if (policy === 'none' && !isDescribe) { this.flushHoles(parent, this.findProtections(t.cStart, t.cEnd, { jsEscapes: true }, [])); return; }
-    if (policy === 'smart' && !isDescribe && this.keepJsString(sig, i, braceStack)) return;
+    const policy = this.stringPolicy(mode, sig, i);
+    // chuỗi giữ nguyên: vẫn đồng bộ nhãn 【…】, khóa trong nháy lồng, đường dẫn biến… (có escape đúng kiểu chuỗi)
+    if ((policy === 'none' || (policy === 'smart' && this.keepJsString(sig, i, braceStack))) && !isDescribe) {
+      this.flushHoles(parent, this.findProtections(t.cStart, t.cEnd, { jsEscapes: true }, []), escFor);
+      return;
+    }
     // chuỗi có HTML bên trong
     if (/<[a-zA-Z\/!]/.test(content)) { this.htmlRange(parent, t.cStart, t.cEnd, { esc, jsEscapes: true }); return; }
     this.textRun(parent, t.cStart, t.cEnd, { esc, kind: isDescribe ? 'desc' : 'ui', jsEscapes: true });
@@ -612,6 +757,9 @@ class Analyzer {
     if (pv === '[' && sig[i - 2] && (sig[i - 2].type === 'ident' || (sig[i - 2].type === 'punct' && [')', ']'].includes(sig[i - 2].value))) && nv === ']') return true;
     // tham số của hàm API (đối số đầu)
     if (pv === '(' && sig[i - 2]?.type === 'ident' && (KEEP_ARG_FUNCS.has(sig[i - 2].value) || PATH_FUNCS.has(sig[i - 2].value))) return true;
+    // chuỗi nằm trong lời gọi hàm API, kể cả khi được nối: getwi(null, sách + ' / 第' + n + '章'), querySelector('#a' + id)
+    const call = enclosingCall(sig, i);
+    if (call && (KEEP_ARG_FUNCS.has(call) || (PATH_FUNCS.has(call) && call.length > 3))) return true;
     // import 'xxx'
     if (pv === 'import' || pv === 'from') return true;
     // includes / startsWith / indexOf / match / split / replace(第一参数)
@@ -619,7 +767,7 @@ class Analyzer {
     return false;
   }
 
-  jsTemplate(parent, t, outerEsc, mode) {
+  jsTemplate(parent, t, outerEsc, mode, sig, ti) {
     const src = this.src;
     const exprHoles = [];
     let anyCJK = false;
@@ -659,8 +807,13 @@ class Analyzer {
         return;
       }
     }
-    const policy = mode === 'ejs' ? (this.opts.ejsStrings ? 'smart' : 'none') : mode === 'schema' ? 'smart' : this.opts.codeStrings;
-    if (policy === 'none') { for (const h of exprHoles) parent.reps.push(...h.node.reps); return; }
+    const policy = mode === 'schema' ? 'smart' : this.stringPolicy(mode, sig || [], ti ?? -1);
+    if (policy === 'none') {
+      for (const h of exprHoles) parent.reps.push(...h.node.reps);
+      // phần tĩnh vẫn đồng bộ nhãn/khóa/đường dẫn
+      for (const p of t.parts) if (p.type === 'str' && hasCJK(src.slice(p.start, p.end))) this.flushHoles(parent, this.findProtections(p.start, p.end, { jsEscapes: true }, []), esc);
+      return;
+    }
     if (/<[a-zA-Z\/!]/.test(masked)) {
       this.htmlRange(parent, cStart, cEnd, { esc, jsEscapes: true, masks: exprHoles.map((h) => ({ start: h.start, end: h.end, hole: h.hole })) });
     } else {
@@ -746,14 +899,14 @@ class Analyzer {
       const indent = line.match(/^[ \t]*/)[0].length;
       if (blockIndent >= 0) {
         if (!line.trim() || indent > blockIndent) {
-          if (hasCJK(line)) this.textRun(parent, lineStart + indent, lineEnd, { kind: 'prose', chunk: false });
+          if (hasCJK(line)) { const pad = ' '.repeat(Math.max(indent, blockIndent + 1)); this.textRun(parent, lineStart + indent, lineEnd, { kind: 'prose', chunk: false, esc: (x) => x.replace(/\r?\n/g, '\n' + pad) }); }
           continue;
         }
         blockIndent = -1;
       }
       if (!line.trim()) continue;
       if (/^\s*#/.test(line)) {
-        if (hasCJK(line)) { const c = line.indexOf('#'); this.textRun(parent, lineStart + c + 1, lineEnd, { kind: 'prose', chunk: false }); }
+        if (hasCJK(line)) { const c = line.indexOf('#'); this.textRun(parent, lineStart + c + 1, lineEnd, { kind: 'prose', chunk: false, esc: oneLine }); }
         continue;
       }
       let p = indent;
@@ -783,7 +936,7 @@ class Analyzer {
       // bỏ chú thích cuối dòng
       const hashIdx = findYamlComment(line, vs);
       if (hashIdx >= 0) {
-        if (hasCJK(line.slice(hashIdx))) this.textRun(parent, lineStart + hashIdx + 1, lineEnd, { kind: 'prose', chunk: false });
+        if (hasCJK(line.slice(hashIdx))) this.textRun(parent, lineStart + hashIdx + 1, lineEnd, { kind: 'prose', chunk: false, esc: oneLine });
         ve = hashIdx;
       }
       while (ve > vs && /[ \t]/.test(line[ve - 1])) ve--;
@@ -803,8 +956,8 @@ class Analyzer {
   }
 
   yamlScalar(parent, a, b, val, esc, dq) {
-    const k = this.exactKind(val);
-    if (k) { parent.reps.push(this.dictRep(a, b, val, k, esc)); return; }
+    const rep = this.exactRep(a, b, val, esc);
+    if (rep) { parent.reps.push(rep); return; }
     if (this.pathInfo(val)) { const hole = this.pathHole(val); parent.reps.push({ start: a, end: b, render: (env) => esc(renderHole(hole, env)) }); return; }
     this.textRun(parent, a, b, { esc, kind: 'prose', chunk: false, yamlEscapes: dq, exact: false });
   }
@@ -851,8 +1004,10 @@ class Analyzer {
         let j = i;
         while (j < end && runRe.test(src[j])) j++;
         const word = src.slice(i, j);
-        if (this.dict.kindOf(word) === 'marker') {
-          const hole = this.dictHole(word, 'marker');
+        const k = this.dict.kindOf(word);
+        // nhãn, hoặc tên biến/giá trị xuất hiện trong regex (vd 好感度:(\d+)) -> cùng bản dịch với nơi khác
+        if (k === 'marker' || k === 'key' || k === 'value') {
+          const hole = this.dictHole(word, k);
           parent.reps.push({ start: i, end: j, render: (env) => escapeRegex(renderHole(hole, env)) });
         }
         i = j; continue;
@@ -881,8 +1036,59 @@ class Analyzer {
     const text = src.slice(start, end);
     const pre = text.match(/^(?:\s*(?:\[[^\]㐀-鿿]*\]|@@?\S+|<[^>㐀-鿿]*>|\{\{[^}]*\}\}))+\s*/);
     const s = start + (pre ? pre[0].length : 0);
-    this.textRun(parent, s, end, { kind: 'name', chunk: false, exact: false });
+    // tên mục trùng một mục từ điển (vd mục "学校" và giá trị địa điểm "学校", mục "高松灯" và khóa "高松灯")
+    // -> dùng đúng bản dịch từ điển để getwi(null, địa_điểm) / getwi(null, '高松灯') vẫn tìm thấy mục
+    let e = end;
+    while (e > s && /\s/.test(src[e - 1])) e--;
+    const name = src.slice(s, e);
+    const k = this.dict.kindOf(name);
+    if (k) { parent.reps.push(this.dictRep(s, e, name, k, identity)); return; }
+    this.textRun(parent, s, end, { kind: 'name', chunk: false, exact: false, esc: oneLine });
   }
+}
+
+/** Dấu { tại sig[i] mở thân class: class X {, class X extends Y {, (class {) */
+function isClassHead(sig, i) {
+  for (let j = i - 1; j >= Math.max(0, i - 16); j--) {
+    const s = sig[j];
+    if (s.type === 'punct' && (s.value === '{' || s.value === '}' || s.value === ';')) return false;
+    if (s.type === 'ident' && s.value === 'class') {
+      const p = sig[j - 1];
+      return !(p && p.type === 'punct' && (p.value === '.' || p.value === '?.'));
+    }
+  }
+  return false;
+}
+
+/** Tên hàm của lời gọi gần nhất bao quanh token sig[i] (vd print('…' + x) -> 'print') */
+function enclosingCall(sig, i) {
+  let depth = 0;
+  for (let j = i - 1; j >= 0 && j >= i - 200; j--) {
+    const s = sig[j];
+    if (s.type !== 'punct') continue;
+    if (s.value === ')' || s.value === ']') depth++;
+    else if (s.value === '(' || s.value === '[') {
+      if (depth === 0) return s.value === '(' && sig[j - 1]?.type === 'ident' ? sig[j - 1].value : null;
+      depth--;
+    } else if (depth === 0 && (s.value === ';' || s.value === '{' || s.value === '}')) return null;
+  }
+  return null;
+}
+
+/** Nội dung <style>/<script> thực ra là văn xuôi: có dấu câu CJK nằm ngoài chuỗi/chú thích (mã hợp lệ không thể có) */
+function rawIsProse(src, a, b, tag) {
+  if (b <= a || !hasCJK(src.slice(a, b))) return false;
+  const PUNCT = /[，。！？；：、]/;
+  if (tag === 'script') return lexJs(src, a, b).some((t) => t.type === 'punct' && PUNCT.test(t.value));
+  return lexCss(src, a, b).some((t) => t.type === 'other' && PUNCT.test(src.slice(t.start, t.end)));
+}
+
+/** Giá trị thuộc tính data-* trông như câu chữ hiển thị/prompt (không phải mã định danh) */
+function looksLikeProseAttr(t) {
+  if (!hasCJK(t)) return false;
+  if (/^(?:https?:|\/\/|data:|#|\.\/|\/[\w-])/i.test(t)) return false;
+  if (/^[\w$.]+\s*\(/.test(t)) return false; // gọi hàm
+  return /[\s，。！？；：、…,.!?;:()（）【】「」『』]/.test(t) || t.length > 12;
 }
 
 function shiftTok(t, base) {
@@ -991,14 +1197,20 @@ export function renderHole(h, env) {
     case 'path': return renderPath(h.src, env);
     case 'macro': return renderMacro(h.src, env);
     case 'multi': return h.parts.map((p) => (p.hole ? renderHole(p.hole, env) : p.text)).join('');
+    case 'composite': return h.parts.map((p) => (hasCJK(p.text) ? lookupDict(env, p.text) : p.text) + p.sep).join('');
     default: return '';
   }
 }
 
 export function renderPath(text, env) {
-  // giữ nguyên dấu phân cách, chỉ thay các đoạn có trong từ điển
+  // giữ nguyên dấu phân cách, chỉ thay các đoạn có trong từ điển; ${a|b|c} (khóa thay thế trong quy tắc MVU) -> thay từng khóa
   return text.replace(/\[\s*(['"])([^'"\]]+)\1\s*\]/g, (m, q, k) => `[${q}${lookupDict(env, k)}${q}]`)
-    .replace(/[^.\/\[\]'"]+/g, (seg) => (hasCJK(seg) ? lookupDict(env, seg) : seg));
+    .replace(/[^.\/\[\]'"]+/g, (seg) => {
+      if (!hasCJK(seg)) return seg;
+      const ph = /^\$\{([^{}]*)\}$/.exec(seg);
+      if (ph) return '${' + ph[1].split('|').map((x) => { const t = x.trim(); return hasCJK(t) ? x.replace(t, lookupDict(env, t)) : x; }).join('|') + '}';
+      return lookupDict(env, seg);
+    });
 }
 
 function renderMacro(text, env) {
@@ -1049,18 +1261,22 @@ export function renderSegment(seg, env) {
 export function analyzeItem(item, ctx) {
   const kind = item.kind;
   if (kind === 'keys' || kind === 'list') return analyzeList(item, ctx);
+  if (kind === 'trimList') return analyzeTrimList(item, ctx);
   const src = String(item.text ?? '');
   const an = new Analyzer(src, ctx);
   const root = new Node(0, src.length);
   const isReplace = !!item.meta?.isReplace;
   switch (kind) {
-    case 'name': an.textRun(root, 0, src.length, { kind: 'name', chunk: false, exact: false }); break;
+    case 'name': an.textRun(root, 0, src.length, { kind: 'name', chunk: false, exact: false, esc: src.includes('\n') ? identity : oneLine }); break;
     case 'comment': an.commentRange(root, 0, src.length); break;
     case 'regexFind': an.regexFind(root, 0, src.length); break;
     case 'regexTrim': an.regexTrim(root, 0, src.length); break;
     case 'initvar': an.initVarRange(root, 0, src.length); break;
     case 'schema': an.jsRange(root, 0, src.length, { mode: 'schema' }); break;
     case 'code': an.jsRange(root, 0, src.length, { mode: 'code' }); break;
+    case 'json': an.jsRange(root, 0, src.length, { mode: 'json' }); break;
+    // tên nút script Tavern Helper: chỉ đổi theo từ điển (cùng bản dịch với getButtonEvent('…') trong mã)
+    case 'button': { const rep = an.exactRep(0, src.length, src, identity); if (rep) root.reps.push(rep); break; }
     default: an.proseRange(root, 0, src.length, { regexRefs: isReplace }); break;
   }
   return {
@@ -1068,6 +1284,90 @@ export function analyzeItem(item, ctx) {
     warnings: an.warnings,
     render(env) { return renderNode(src, root, { ...env, src }); },
   };
+}
+
+/** trimStrings của regex: chỉ đồng bộ nhãn theo từ điển */
+function analyzeTrimList(item, ctx) {
+  const arr = Array.isArray(item.text) ? item.text : [];
+  const parts = arr.map((s) => {
+    const str = String(s ?? '');
+    return { str, a: hasCJK(str) ? analyzeItem({ kind: 'regexTrim', text: str }, ctx) : null };
+  });
+  return {
+    segments: [],
+    warnings: [],
+    render(env) { return parts.map((p) => (p.a ? p.a.render(env) : p.str)); },
+  };
+}
+
+/**
+ * Tìm tên mục lorebook bị EJS / script ghép động, vd getwi(null, bookName + ' / 第' + n + '章')
+ * hoặc e.comment.includes('事件') — các mục này phải GIỮ NGUYÊN tên, nếu không mã sẽ không tìm thấy.
+ * (Tên mục được gọi nguyên văn như getwi(null, '▶️开局流程') thì vẫn dịch được: lời gọi được đổi theo.)
+ * Trả về { pinned: Set<tên mục>, dynamic: [biểu thức tên lấy hoàn toàn từ biến] }
+ */
+export function findDynamicEntryRefs(texts, entryNames) {
+  const pinned = new Set();
+  const dynamic = [];
+  const names = [...entryNames].filter(Boolean);
+  if (!names.length) return { pinned, dynamic };
+  const callRe = /\b(?:getwi|getWI|getWorldInfo|activewi|activateWorldInfo|activateWI|getEntry|getLorebookEntry)\s*\(/g;
+  const cmpRe = /\.comment\s*\??\.?\s*(?:includes|startsWith|endsWith|indexOf|search|match)\s*\(\s*(['"`])([^'"`\n]+)\1/g;
+  for (const text of texts) {
+    if (typeof text !== 'string' || !/getwi|getWorldInfo|activewi|activateWorldInfo|activateWI|getEntry|getLorebookEntry|\.comment/i.test(text)) continue;
+    let m;
+    callRe.lastIndex = 0;
+    while ((m = callRe.exec(text))) {
+      const args = splitCallArgs(text, m.index + m[0].length);
+      if (!args || !args.length) continue;
+      const title = (args.length >= 2 ? args[1] : args[0]).trim();
+      if (!title) continue;
+      if (/^(['"])(?:(?!\1)[^\\]|\\.)*\1$/.test(title) || (/^`[^`]*`$/.test(title) && !title.includes('${'))) continue; // tên cố định
+      const frags = stringFragments(title).filter(hasCJK);
+      if (!frags.length) { if (/[A-Za-z_$]/.test(title) && !/^\d+$/.test(title)) dynamic.push(title.slice(0, 80)); continue; }
+      for (const n of names) if (frags.every((f) => n.includes(f))) pinned.add(n);
+    }
+    cmpRe.lastIndex = 0;
+    while ((m = cmpRe.exec(text))) {
+      const f = m[2];
+      if (!hasCJK(f)) continue;
+      for (const n of names) if (n !== f && n.includes(f)) pinned.add(n);
+    }
+  }
+  return { pinned, dynamic };
+}
+
+/** Tách các đối số cấp cao nhất của lời gọi hàm, bắt đầu ngay sau dấu '(' */
+function splitCallArgs(text, pos) {
+  const args = [];
+  let depth = 0, q = null, cur = '';
+  for (let i = pos; i < text.length && i < pos + 4000; i++) {
+    const c = text[i];
+    if (q) {
+      cur += c;
+      if (c === '\\') { cur += text[++i] ?? ''; continue; }
+      if (c === q) q = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { q = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) { if (c === ')') { args.push(cur); return args; } return null; }
+      depth--;
+    } else if (c === ',' && depth === 0) { args.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  return null;
+}
+
+/** Các mảnh chuỗi tĩnh trong một biểu thức JS ('…', "…", phần tĩnh của `…${}…`) */
+function stringFragments(expr) {
+  const out = [];
+  for (const t of lexJs(expr)) {
+    if (t.type === 'str') out.push(expr.slice(t.cStart, t.cEnd));
+    else if (t.type === 'tmpl') for (const p of t.parts) if (p.type === 'str' && p.end > p.start) out.push(expr.slice(p.start, p.end));
+  }
+  return out.filter((s) => s.trim());
 }
 
 function analyzeList(item, ctx) {

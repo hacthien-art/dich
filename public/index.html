@@ -21,6 +21,7 @@
       <button id="btnProjects" class="btn small ghost" title="Mở dự án đã lưu">📂 Dự án</button>
     </div>
     <div class="top-actions">
+      <button id="btnUpdate" class="btn update" hidden title="Có bản mới trên GitHub">⬆ Cập nhật</button>
       <button id="btnImport" class="btn">📥 Nhập card</button>
       <button id="btnTranslateAll" class="btn primary" disabled>▶ Dịch toàn bộ</button>
       <button id="btnRetry" class="btn" disabled title="Dịch lại các đoạn chưa dịch hoặc bị lỗi / còn sót chữ Hán">🔁 Dịch chỗ thiếu/lỗi</button>
@@ -47,7 +48,7 @@
     <button class="tab" data-tab="preview"><span>🧩</span>Regex &amp; Xem trước</button>
     <button class="tab" data-tab="settings"><span>⚙️</span>Cài đặt dịch</button>
     <button class="tab" data-tab="log"><span>📜</span>Nhật ký <em id="logBadge" class="badge" hidden>0</em></button>
-    <div class="sidebar-foot muted small">Chạy cục bộ · dữ liệu lưu trong thư mục <code>data/</code></div>
+    <div class="sidebar-foot muted small">Chạy cục bộ · dữ liệu lưu trong thư mục <code>data/</code><div id="appVersion" class="app-version"></div></div>
   </nav>
 
   <main id="main">

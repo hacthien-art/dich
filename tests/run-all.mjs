@@ -1,6 +1,7 @@
 // Kiểm thử bất biến của bộ phân tích trên các card mẫu trong thư mục gốc.
 // 1) Không dịch + từ điển giữ nguyên  => render phải trả lại đúng 100% văn bản gốc
-// 2) Dịch giả (chuỗi "khó": nháy, ${}, <, :, #) + đổi tên biến => schema/JS/YAML vẫn hợp lệ, InitVar qua được schema
+// 2) Dịch giả (chuỗi "khó": nháy, ${}, <, :, #, xuống dòng, */, -->, %>) + đổi tên biến
+//    => schema/JS/YAML/EJS vẫn hợp lệ, InitVar qua được schema
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -36,6 +37,26 @@ function compiles(code, isModule) {
   } catch (e) { return e.message; }
 }
 
+/** Biên dịch thử mẫu EJS giống thư viện ejs (ST-Prompt-Template): tách thẻ, dựng hàm, kiểm tra cú pháp */
+function ejsCompiles(tpl) {
+  try {
+    const parts = tpl.split(/(<%%|%%>|<%=|<%-|<%_|<%#|<%|%>|-%>|_%>)/);
+    let mode = null, src = '';
+    for (const p of parts) {
+      if (p === '<%%' || p === '%%>') { if (!mode) src += '; __o+=' + JSON.stringify(p) + '\n'; else src += p; continue; }
+      if (['<%=', '<%-', '<%_', '<%#', '<%'].includes(p)) { if (mode) throw new Error('Could not find matching close tag for "' + mode + '".'); mode = p; continue; }
+      if (['%>', '-%>', '_%>'].includes(p)) { mode = null; continue; }
+      if (!mode) { src += '; __o+=' + JSON.stringify(p) + '\n'; continue; }
+      if (mode === '<%#') continue;
+      if (mode === '<%=' || mode === '<%-') src += '; __o+=(' + p.replace(/;(\s*$)/, '$1') + ')\n';
+      else src += '; ' + p + '\n';
+    }
+    if (mode) throw new Error('Could not find matching close tag for "' + mode + '".');
+    new vm.Script('(async function(){let __o="";' + src + '\n})');
+    return null;
+  } catch (e) { return e.message; }
+}
+
 function runSchema(code, data) {
   // bỏ import, chuyển export const -> const, bắt registerMvuSchema
   let captured = null;
@@ -46,11 +67,19 @@ function runSchema(code, data) {
   return S.safeParse(data);
 }
 
-const nastyTranslate = (key) => {
-  // bản dịch giả: giữ placeholder, thêm ký tự nguy hiểm
-  const phs = key.match(PH_RE) || [];
-  return `Việt'"\`\${x}<b>&: # ` + key.replace(/[㐀-鿿]+/g, 'chữ') + (phs.length ? '' : '');
-};
+const PASSES = [
+  {
+    label: 'lượt 1 (mặc định cũ: không dịch chú thích)',
+    opts: { codeStrings: 'smart', chunkSize: 1800 },
+    // bản dịch giả: giữ placeholder, thêm ký tự nguy hiểm
+    nasty: (key) => `Việt'"\`\${x}<b>&: # ` + key.replace(/[㐀-鿿]+/g, 'chữ'),
+  },
+  {
+    label: 'lượt 2 (dịch chú thích + bản dịch có xuống dòng, */, -->, %>)',
+    opts: { codeStrings: 'smart', chunkSize: 1800, comments: true },
+    nasty: (key) => `Việt'"\`\${x}<b>&: # */ --> %> \\` + key.replace(/[㐀-鿿]+/g, 'chữ\nmới'),
+  },
+];
 
 for (const file of cards) {
   console.log('\n=== ' + file);
@@ -66,102 +95,119 @@ for (const file of cards) {
   const settings = { varMode: 'translate', namingStyle: 'natural' };
   const idIndex = makeDictIndex(dict, settings);
   const entryNames = new Set((card.raw.data.character_book?.entries || []).map((e) => e.comment).filter(Boolean));
-  const ctx = { dict: idIndex, entryNames, opts: { codeStrings: 'smart', chunkSize: 1800 } };
 
-  // ---------- 1) bất biến đồng nhất
-  let segCount = 0, segChars = 0;
-  const analyses = new Map();
-  let t0 = Date.now();
-  for (const it of items) {
-    const a = analyzeItem(it, ctx);
-    analyses.set(it.id, a);
-    segCount += a.segments.length;
-    segChars += a.segments.reduce((n, s) => n + s.key.length, 0);
-    const out = a.render({ tm: new Map(), dict: idIndex });
-    const same = Array.isArray(it.text) ? JSON.stringify(out) === JSON.stringify([...new Set(it.text)]) : out === it.text;
-    if (!same) {
-      let i = 0; const a1 = String(it.text), b1 = String(out);
-      while (i < a1.length && a1[i] === b1[i]) i++;
-      fail(`Render không đồng nhất: ${it.label} @${i}: «${a1.slice(Math.max(0, i - 30), i + 40)}» vs «${b1.slice(Math.max(0, i - 30), i + 40)}»`);
+  for (const pass of PASSES) {
+    console.log('  -- ' + pass.label);
+    const ctx = { dict: idIndex, entryNames, opts: pass.opts };
+
+    // ---------- 1) bất biến đồng nhất
+    let segCount = 0, segChars = 0;
+    const analyses = new Map();
+    const t0 = Date.now();
+    for (const it of items) {
+      const a = analyzeItem(it, ctx);
+      analyses.set(it.id, a);
+      segCount += a.segments.length;
+      segChars += a.segments.reduce((n, s) => n + s.key.length, 0);
+      const out = a.render({ tm: new Map(), dict: idIndex });
+      const same = Array.isArray(it.text) ? JSON.stringify(out) === JSON.stringify(it.kind === 'trimList' ? it.text : [...new Set(it.text)]) : out === it.text;
+      if (!same) {
+        let i = 0; const a1 = String(it.text), b1 = String(out);
+        while (i < a1.length && a1[i] === b1[i]) i++;
+        fail(`Render không đồng nhất: ${it.label} @${i}: «${a1.slice(Math.max(0, i - 30), i + 40)}» vs «${b1.slice(Math.max(0, i - 30), i + 40)}»`);
+      }
     }
-  }
-  ok(`đồng nhất OK — ${segCount} đoạn, ${segChars} ký tự cần dịch, ${Date.now() - t0}ms`);
-  const warns = [...new Set([...analyses.values()].flatMap((a) => a.warnings))];
-  if (warns.length) console.log('  ! cảnh báo: ' + warns.slice(0, 5).join(' | '));
+    ok(`đồng nhất OK — ${segCount} đoạn, ${segChars} ký tự cần dịch, ${Date.now() - t0}ms`);
+    const warns = [...new Set([...analyses.values()].flatMap((a) => a.warnings))];
+    if (warns.length && pass === PASSES[0]) console.log('  ! cảnh báo: ' + warns.slice(0, 5).join(' | '));
 
-  // ---------- 2) dịch giả + đổi tên biến có dấu cách
-  const fakeDict = JSON.parse(JSON.stringify(dict));
-  let n = 0;
-  for (const [src, v] of Object.entries(fakeDict)) v.dst = (v.kind === 'key' ? `Khóa ${++n} ${src.length}` : v.kind === 'value' ? `Giá trị ${++n}` : `Từ ${++n}`);
-  const fIndex = makeDictIndex(fakeDict, settings);
-  const tm = new Map();
-  for (const a of analyses.values()) for (const s of a.segments) tm.set(s.key, nastyTranslate(s.key));
-  const env = { tm, dict: fIndex, entryName: (s) => 'Mục ' + s.length, keysMode: 'append' };
-  const outputs = new Map();
-  for (const it of items) outputs.set(it.id, analyses.get(it.id).render(env));
+    // ---------- 2) dịch giả + đổi tên biến có dấu cách
+    const fakeDict = JSON.parse(JSON.stringify(dict));
+    let n = 0;
+    for (const [src, v] of Object.entries(fakeDict)) v.dst = (v.kind === 'key' ? `Khóa ${++n} ${src.length}` : v.kind === 'value' ? `Giá trị ${++n}` : `Từ ${++n}`);
+    const fIndex = makeDictIndex(fakeDict, settings);
+    const tm = new Map();
+    for (const a of analyses.values()) for (const s of a.segments) tm.set(s.key, pass.nasty(s.key));
+    const env = { tm, dict: fIndex, entryName: (s) => 'Mục ' + s.length, keysMode: 'append' };
+    const outputs = new Map();
+    for (const it of items) outputs.set(it.id, analyses.get(it.id).render(env));
 
-  // a) script trong HTML vẫn biên dịch được (nếu bản gốc biên dịch được)
-  let jsChecked = 0, jsBad = 0;
-  for (const it of items) {
-    if (typeof it.text !== 'string' || !/<script/i.test(it.text)) continue;
-    const before = scriptsOf(it.text), after = scriptsOf(outputs.get(it.id));
-    if (before.length !== after.length) { fail(`${it.label}: số thẻ <script> thay đổi ${before.length} -> ${after.length}`); continue; }
-    before.forEach((b, i) => {
-      if (/\$\d|\{\{/.test(b.code)) return; // có $1 / macro: chỉ hợp lệ sau khi thay thế
-      const e0 = compiles(b.code, b.isModule);
-      if (e0) return;
-      jsChecked++;
-      const e1 = compiles(after[i].code, after[i].isModule);
-      if (e1) { jsBad++; fail(`${it.label}: script #${i} hỏng sau dịch: ${e1}`); }
-    });
-  }
-  if (!jsBad) ok(`${jsChecked} script HTML vẫn biên dịch được sau khi dịch giả`);
-
-  // b) script Tavern Helper
-  for (const it of items) {
-    if (it.kind !== 'schema' && it.kind !== 'code') continue;
-    const e0 = compiles(it.text, true), e1 = compiles(outputs.get(it.id), true);
-    if (!e0 && e1) fail(`${it.label}: hỏng sau dịch: ${e1}`); else ok(`${it.label}: biên dịch OK`);
-  }
-
-  // c) InitVar YAML parse + schema
-  const ivItems = items.filter((it) => it.kind === 'initvar');
-  const schemaItem = items.find((it) => it.kind === 'schema');
-  for (const it of ivItems) {
-    let d0, d1;
-    try { d0 = yaml.load(it.text); } catch (e) { fail('InitVar gốc lỗi: ' + e.message); continue; }
-    try { d1 = yaml.load(outputs.get(it.id)); } catch (e) { fail('InitVar sau dịch lỗi YAML: ' + e.message.split('\n')[0]); console.log(outputs.get(it.id).slice(0, 600)); continue; }
-    const k0 = JSON.stringify(Object.keys(d0 || {})), k1 = JSON.stringify(Object.keys(d1 || {}));
-    ok(`InitVar YAML OK: ${k0.slice(0, 80)} -> ${k1.slice(0, 80)}`);
-    if (schemaItem) {
-      try {
-        const r0 = runSchema(schemaItem.text, d0);
-        const r1 = runSchema(outputs.get(schemaItem.id), d1);
-        if (!r0.success) console.log('  ! schema gốc không qua InitVar gốc: ' + JSON.stringify(r0.error.issues.slice(0, 2)));
-        if (r0.success && !r1.success) fail('Schema sau dịch từ chối InitVar sau dịch: ' + JSON.stringify(r1.error.issues.slice(0, 3)).slice(0, 600));
-        else if (r1.success) ok('Schema (sau dịch) chấp nhận InitVar (sau dịch) — đồng bộ biến OK');
-        // so sánh cấu trúc sau parse
-        const shape = (o) => (o && typeof o === 'object' ? Object.values(o).map(shape) : typeof o);
-        if (r0.success && r1.success && JSON.stringify(shape(r0.data)) !== JSON.stringify(shape(r1.data))) fail('Cấu trúc dữ liệu sau schema khác nhau');
-      } catch (e) { fail('Chạy schema lỗi: ' + e.message); }
+    // a) script trong HTML vẫn biên dịch được (nếu bản gốc biên dịch được)
+    let jsChecked = 0, jsBad = 0;
+    for (const it of items) {
+      if (typeof it.text !== 'string' || !/<script/i.test(it.text)) continue;
+      const before = scriptsOf(it.text), after = scriptsOf(outputs.get(it.id));
+      if (before.length !== after.length) { fail(`${it.label}: số thẻ <script> thay đổi ${before.length} -> ${after.length}`); continue; }
+      before.forEach((b, i) => {
+        if (/\$\d|\{\{/.test(b.code)) return; // có $1 / macro: chỉ hợp lệ sau khi thay thế
+        const e0 = compiles(b.code, b.isModule);
+        if (e0) return;
+        jsChecked++;
+        const e1 = compiles(after[i].code, after[i].isModule);
+        if (e1) { jsBad++; fail(`${it.label}: script #${i} hỏng sau dịch: ${e1}`); }
+      });
     }
-  }
+    if (!jsBad) ok(`${jsChecked} script HTML vẫn biên dịch được sau khi dịch giả`);
 
-  // d) placeholder không lọt ra ngoài
-  for (const it of items) {
-    const o = outputs.get(it.id);
-    const s = Array.isArray(o) ? o.join('\n') : o;
-    if (/⟦\d+⟧/.test(s)) fail(`${it.label}: còn placeholder trong kết quả`);
-  }
-  // e) khóa biến đã đổi trong regex HTML
-  const statusRegex = items.filter((it) => it.meta?.isReplace && /stat_data/.test(it.text));
-  for (const it of statusRegex) {
-    const o = outputs.get(it.id);
-    const left = (o.match(/stat_data[.\w'"[\]㐀-鿿]*/g) || []).filter((p) => /[㐀-鿿]/.test(p));
-    if (left.length) console.log(`  ! ${it.label}: còn đường dẫn tiếng Trung: ${left.slice(0, 3).join(', ')}`);
-    else ok(`${it.label}: đường dẫn stat_data đã đồng bộ`);
+    // b) script Tavern Helper
+    for (const it of items) {
+      if (it.kind !== 'schema' && it.kind !== 'code') continue;
+      const e0 = compiles(it.text, true), e1 = compiles(outputs.get(it.id), true);
+      if (!e0 && e1) fail(`${it.label}: hỏng sau dịch: ${e1}`); else ok(`${it.label}: biên dịch OK`);
+    }
+
+    // b2) mẫu EJS (ST-Prompt-Template) vẫn biên dịch được
+    let ejsChecked = 0;
+    for (const it of items) {
+      if (typeof it.text !== 'string' || !it.text.includes('<%')) continue;
+      if (ejsCompiles(it.text)) continue;
+      ejsChecked++;
+      const e1 = ejsCompiles(String(outputs.get(it.id)));
+      if (e1) fail(`${it.label}: EJS hỏng sau dịch: ${e1}`);
+    }
+    if (ejsChecked) ok(`${ejsChecked} mục EJS vẫn biên dịch được sau khi dịch giả`);
+
+    // c) InitVar YAML parse + schema
+    const ivItems = items.filter((it) => it.kind === 'initvar');
+    const schemaItem = items.find((it) => it.kind === 'schema');
+    for (const it of ivItems) {
+      let d0, d1;
+      try { d0 = yaml.load(it.text); } catch (e) { fail('InitVar gốc lỗi: ' + e.message); continue; }
+      try { d1 = yaml.load(outputs.get(it.id)); } catch (e) { fail('InitVar sau dịch lỗi YAML: ' + e.message.split('\n')[0]); console.log(outputs.get(it.id).slice(0, 600)); continue; }
+      const k0 = JSON.stringify(Object.keys(d0 || {})), k1 = JSON.stringify(Object.keys(d1 || {}));
+      ok(`InitVar YAML OK: ${k0.slice(0, 80)} -> ${k1.slice(0, 80)}`);
+      if (schemaItem) {
+        try {
+          const r0 = runSchema(schemaItem.text, d0);
+          const r1 = runSchema(outputs.get(schemaItem.id), d1);
+          if (!r0.success) console.log('  ! schema gốc không qua InitVar gốc: ' + JSON.stringify(r0.error.issues.slice(0, 2)));
+          if (r0.success && !r1.success) fail('Schema sau dịch từ chối InitVar sau dịch: ' + JSON.stringify(r1.error.issues.slice(0, 3)).slice(0, 600));
+          else if (r1.success) ok('Schema (sau dịch) chấp nhận InitVar (sau dịch) — đồng bộ biến OK');
+          // so sánh cấu trúc sau parse
+          const shape = (o) => (o && typeof o === 'object' ? Object.values(o).map(shape) : typeof o);
+          if (r0.success && r1.success && JSON.stringify(shape(r0.data)) !== JSON.stringify(shape(r1.data))) fail('Cấu trúc dữ liệu sau schema khác nhau');
+        } catch (e) { fail('Chạy schema lỗi: ' + e.message); }
+      }
+    }
+
+    // d) placeholder không lọt ra ngoài; JSON (biến Tavern Helper) đọc lại được
+    for (const it of items) {
+      const o = outputs.get(it.id);
+      const s = Array.isArray(o) ? o.join('\n') : o;
+      if (/⟦\d+⟧/.test(s)) fail(`${it.label}: còn placeholder trong kết quả`);
+      if (it.kind === 'json') { try { JSON.parse(o); } catch (e) { fail(`${it.label}: JSON hỏng sau dịch: ${e.message}`); } }
+    }
+    // e) khóa biến đã đổi trong regex HTML
+    const statusRegex = items.filter((it) => it.meta?.isReplace && /stat_data/.test(it.text));
+    for (const it of statusRegex) {
+      const o = outputs.get(it.id);
+      const left = (o.match(/stat_data[.\w'"[\]㐀-鿿]*/g) || []).filter((p) => /[㐀-鿿]/.test(p));
+      if (left.length) console.log(`  ! ${it.label}: còn đường dẫn tiếng Trung: ${left.slice(0, 3).join(', ')}`);
+      else if (pass === PASSES[0]) ok(`${it.label}: đường dẫn stat_data đã đồng bộ`);
+    }
   }
 }
 
 console.log(failures ? `\n${failures} lỗi` : '\nTất cả kiểm thử đều qua ✓');
 process.exit(failures ? 1 : 0);
+void PH_RE;

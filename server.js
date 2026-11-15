@@ -7,12 +7,16 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { exec } from 'node:child_process';
+import zlib from 'node:zlib';
+import { exec, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = path.join(ROOT, 'data');
+const PKG = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')); } catch { return {}; } })();
+const APP_VERSION = PKG.version || '0.0.0';
+const STARTED_AT = Date.now();
 const args = process.argv.slice(2);
 const argVal = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const PORT = Number(argVal('--port') || process.env.PORT || 8686);
@@ -327,16 +331,221 @@ async function serveStatic(req, res, pathname) {
   }
 }
 
+// ---------------------------------------------------------------- cập nhật từ GitHub
+// Cài bằng git clone -> git fetch + merge --ff-only; tải zip -> tải zip nhánh main và chép đè (giữ nguyên data/).
+const UPDATE_BRANCH = 'main';
+const VERSION_FILE = path.join(ROOT, 'version.json'); // sha của bản zip đã cài (không có trong repo)
+let updateCache = null; // { t, result }
+
+function run(cmd, args, { timeout = 30000 } = {}) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { cwd: ROOT, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || err?.message || '') });
+    });
+  });
+}
+
+function repoOf(url) {
+  const m = /github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(String(url || '').trim());
+  return m ? { owner: m[1], name: m[2] } : null;
+}
+
+async function gitInfo() {
+  if (!fs.existsSync(path.join(ROOT, '.git'))) return { git: false };
+  const v = await run('git', ['--version'], { timeout: 8000 });
+  if (v.code) return { git: false, noGitBinary: true };
+  const [sha, branch, remote, status] = await Promise.all([
+    run('git', ['rev-parse', 'HEAD']), run('git', ['rev-parse', '--abbrev-ref', 'HEAD']),
+    run('git', ['remote', 'get-url', 'origin']), run('git', ['status', '--porcelain', '--untracked-files=no']),
+  ]);
+  return { git: true, sha: sha.stdout.trim(), branch: branch.stdout.trim(), remote: remote.stdout.trim(), dirty: !!status.stdout.trim() };
+}
+
+function localZipSha() {
+  try { return JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8')).sha || null; } catch { return null; }
+}
+
+function semverGt(a, b) {
+  const pa = String(a || '0').split(/[.+-]/).map((x) => parseInt(x, 10) || 0), pb = String(b || '0').split(/[.+-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0); }
+  return false;
+}
+
+async function ghJson(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'TavernCardTranslator-Updater', Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error(`GitHub trả lỗi HTTP ${r.status}${r.status === 403 ? ' (có thể vượt giới hạn truy vấn, thử lại sau ít phút)' : ''}`);
+  return r.json();
+}
+
+async function checkUpdate(force) {
+  if (!force && updateCache && Date.now() - updateCache.t < 20 * 60 * 1000) return updateCache.result;
+  const info = await gitInfo();
+  const repo = repoOf(PKG.repository?.url || PKG.repository) || repoOf(info.remote);
+  if (!repo) throw new Error('Không xác định được kho GitHub của app (thiếu "repository" trong package.json)');
+  const base = { repo: `${repo.owner}/${repo.name}`, branch: UPDATE_BRANCH, current: { version: APP_VERSION, sha: info.sha || localZipSha() } };
+  let result = null;
+  if (info.git) {
+    const f = await run('git', ['fetch', '--quiet', 'origin', UPDATE_BRANCH], { timeout: 60000 });
+    if (!f.code) {
+      const ref = `origin/${UPDATE_BRANCH}`;
+      const [behind, ahead, log, pkg, rsha] = await Promise.all([
+        run('git', ['rev-list', '--count', `HEAD..${ref}`]), run('git', ['rev-list', '--count', `${ref}..HEAD`]),
+        run('git', ['log', '--format=%h%x09%cI%x09%s', `HEAD..${ref}`, '-n', '40']),
+        run('git', ['show', `${ref}:package.json`]), run('git', ['rev-parse', ref]),
+      ]);
+      let latestVersion = null;
+      try { latestVersion = JSON.parse(pkg.stdout).version; } catch { /* */ }
+      const nBehind = parseInt(behind.stdout, 10) || 0;
+      const commits = log.stdout.split('\n').filter(Boolean).map((l) => { const [sha, date, ...msg] = l.split('\t'); return { sha, date, message: msg.join('\t') }; });
+      result = {
+        ...base, method: 'git', latest: { version: latestVersion, sha: rsha.stdout.trim() }, behind: nBehind, ahead: parseInt(ahead.stdout, 10) || 0,
+        available: nBehind > 0, commits, dirty: info.dirty, onBranch: info.branch === UPDATE_BRANCH,
+        canApply: nBehind > 0 && info.branch === UPDATE_BRANCH,
+        note: info.branch !== UPDATE_BRANCH ? `Thư mục app đang ở nhánh "${info.branch}" — chỉ tự cập nhật được trên nhánh ${UPDATE_BRANCH}.` : info.dirty ? 'Có file trong app bị sửa tay (git status) — nếu trùng với bản mới, cập nhật sẽ dừng để không ghi đè.' : '',
+      };
+    }
+  }
+  if (!result) {
+    // không có git (cài bằng zip) hoặc git fetch lỗi -> hỏi GitHub API
+    const api = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+    const head = await ghJson(`${api}/commits/${UPDATE_BRANCH}`);
+    let latestVersion = null;
+    try {
+      const r = await fetch(`https://raw.githubusercontent.com/${repo.owner}/${repo.name}/${head.sha}/package.json`, { headers: { 'User-Agent': 'TavernCardTranslator-Updater' }, signal: AbortSignal.timeout(20000) });
+      if (r.ok) latestVersion = (await r.json()).version || null;
+    } catch { /* */ }
+    const cur = base.current.sha;
+    const available = cur ? head.sha !== cur && !head.sha.startsWith(cur) : semverGt(latestVersion, APP_VERSION);
+    let commits = [];
+    try {
+      if (cur && available) {
+        const cmp = await ghJson(`${api}/compare/${cur}...${head.sha}`);
+        commits = (cmp.commits || []).reverse().slice(0, 40).map((c) => ({ sha: c.sha.slice(0, 7), date: c.commit?.committer?.date, message: String(c.commit?.message || '').split('\n')[0] }));
+      } else if (available) {
+        commits = [{ sha: head.sha.slice(0, 7), date: head.commit?.committer?.date, message: String(head.commit?.message || '').split('\n')[0] }];
+      }
+    } catch { /* */ }
+    result = {
+      ...base, method: info.git && !info.noGitBinary ? 'git-api' : 'zip', latest: { version: latestVersion, sha: head.sha }, available, commits,
+      canApply: available && !(info.git && !info.noGitBinary),
+      note: info.git && !info.noGitBinary ? 'Không chạy được "git fetch" (mạng/quyền truy cập?) — hãy chạy "git pull" trong thư mục app.' : '',
+    };
+  }
+  updateCache = { t: Date.now(), result };
+  return result;
+}
+
+/** Giải nén zip (đủ cho file zip GitHub tạo: stored/deflate) -> [{ name, data }] */
+function unzip(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('File zip hỏng (không tìm thấy End of Central Directory)');
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error('Central directory của zip hỏng');
+    const method = buf.readUInt16LE(p + 10);
+    const csize = buf.readUInt32LE(p + 20), usize = buf.readUInt32LE(p + 24);
+    const nlen = buf.readUInt16LE(p + 28), elen = buf.readUInt16LE(p + 30), clen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const name = buf.toString('utf8', p + 46, p + 46 + nlen);
+    p += 46 + nlen + elen + clen;
+    if (name.endsWith('/')) continue;
+    if (buf.readUInt32LE(lho) !== 0x04034b50) throw new Error('Local header của zip hỏng: ' + name);
+    const start = lho + 30 + buf.readUInt16LE(lho + 26) + buf.readUInt16LE(lho + 28);
+    const raw = buf.subarray(start, start + csize);
+    const data = method === 0 ? Buffer.from(raw) : method === 8 ? zlib.inflateRawSync(raw) : null;
+    if (!data) throw new Error('Kiểu nén zip không hỗ trợ: ' + method);
+    if (data.length !== usize) throw new Error('Giải nén sai kích thước: ' + name);
+    out.push({ name, data });
+  }
+  return out;
+}
+
+async function applyUpdate() {
+  const st = await checkUpdate(true);
+  if (!st.available) return { updated: false, message: 'Đang dùng bản mới nhất.' };
+  if (st.method === 'git') {
+    if (!st.onBranch) throw new Error(st.note);
+    const r = await run('git', ['merge', '--ff-only', `origin/${UPDATE_BRANCH}`], { timeout: 120000 });
+    if (r.code) throw new Error('git không cập nhật được (thường do file trong app bị sửa tay). Chi tiết: ' + (r.stderr || r.stdout).trim().slice(0, 800));
+    updateCache = null;
+    return { updated: true, method: 'git', message: `Đã cập nhật ${st.behind} thay đổi (${st.current.sha?.slice(0, 7)} → ${st.latest.sha.slice(0, 7)}).` };
+  }
+  if (st.method !== 'zip') throw new Error(st.note || 'Không tự cập nhật được — hãy chạy "git pull" trong thư mục app.');
+  const [owner, name] = st.repo.split('/');
+  const r = await fetch(`https://codeload.github.com/${owner}/${name}/zip/${st.latest.sha}`, { headers: { 'User-Agent': 'TavernCardTranslator-Updater' }, signal: AbortSignal.timeout(180000) });
+  if (!r.ok) throw new Error(`Không tải được bản mới (HTTP ${r.status})`);
+  const entries = unzip(Buffer.from(await r.arrayBuffer()));
+  // chép đè file của app; không đụng tới dữ liệu người dùng
+  const SKIP = /^(data|node_modules|\.git)(\/|$)/;
+  let n = 0;
+  const writes = [];
+  for (const e of entries) {
+    const rel = e.name.split('/').slice(1).join('/'); // bỏ thư mục gốc "dich-<sha>/"
+    if (!rel || SKIP.test(rel) || rel.split('/').some((s) => s === '..' || s === '') || path.isAbsolute(rel)) continue;
+    const dest = path.join(ROOT, rel);
+    if (!dest.startsWith(ROOT + path.sep)) continue;
+    writes.push({ dest, data: e.data });
+  }
+  if (!writes.some((w) => w.dest === path.join(ROOT, 'server.js'))) throw new Error('File zip không giống mã nguồn app (thiếu server.js) — dừng cập nhật');
+  for (const w of writes) {
+    await fsp.mkdir(path.dirname(w.dest), { recursive: true });
+    await fsp.writeFile(w.dest + '.upd-tmp', w.data);
+    await fsp.rename(w.dest + '.upd-tmp', w.dest);
+    n++;
+  }
+  await fsp.writeFile(VERSION_FILE, JSON.stringify({ sha: st.latest.sha, version: st.latest.version, updatedAt: new Date().toISOString() }, null, 2));
+  updateCache = null;
+  return { updated: true, method: 'zip', message: `Đã tải bản mới (${n} file) — ${st.latest.version || st.latest.sha.slice(0, 7)}.` };
+}
+
+/** Khởi động lại: đóng cổng, chạy tiến trình máy chủ mới dùng chung cửa sổ console; tiến trình này đợi tới khi nó thoát */
+let restarting = false;
+function restartSelf() {
+  if (restarting) return;
+  restarting = true;
+  console.log('Đang khởi động lại để dùng bản mới…');
+  const args = process.argv.slice(1).filter((a) => a !== '--no-open');
+  args.push('--no-open');
+  let pending = 2;
+  const go = () => {
+    if (--pending > 0) return;
+    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: 'inherit', env: { ...process.env, TCT_RESTART: '1' } });
+    child.on('exit', (code) => process.exit(code ?? 0));
+    child.on('error', (e) => { logError('Không khởi động lại được', e); process.exit(1); });
+  };
+  for (const srv of [server, frameServer]) {
+    srv.closeAllConnections?.();
+    if (srv.listening) srv.close(() => go()); else go();
+  }
+}
+
 // ---------------------------------------------------------------- router
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
   try {
+    // kiểm tra sống (không cần token) — trang dùng để biết máy chủ đã khởi động lại xong sau khi cập nhật
+    if (p === '/healthz') return send(res, 200, { ok: true, version: APP_VERSION, started: STARTED_AT });
     if (p.startsWith('/api/')) {
       if (req.headers['x-app-token'] !== TOKEN) return send(res, 403, { error: 'Token không hợp lệ — hãy tải lại trang (F5).' });
       if (p === '/api/llm/models' && req.method === 'POST') return await handleModels(req, res);
       if (p === '/api/llm/chat' && req.method === 'POST') return await handleChat(req, res);
-      if (p === '/api/ping') return send(res, 200, { ok: true, version: '1.0.0' });
+      if (p === '/api/ping') return send(res, 200, { ok: true, version: APP_VERSION, started: STARTED_AT });
+      if (p === '/api/update/check' && req.method === 'POST') {
+        const { force } = await readJson(req);
+        try { return send(res, 200, await checkUpdate(!!force)); } catch (e) { return send(res, 200, { error: String(e.message || e), current: { version: APP_VERSION } }); }
+      }
+      if (p === '/api/update/apply' && req.method === 'POST') {
+        try { return send(res, 200, await applyUpdate()); } catch (e) { logError('[update]', e); return send(res, 500, { error: String(e.message || e) }); }
+      }
+      if (p === '/api/update/restart' && req.method === 'POST') {
+        send(res, 200, { ok: true });
+        setTimeout(restartSelf, 300);
+        return;
+      }
       if (p.startsWith('/api/store/')) return await handleStore(req, res, p.slice('/api/store/'.length).split('/').filter(Boolean));
       if (p.startsWith('/api/blob/')) return await handleBlob(req, res, p.slice('/api/blob/'.length).split('/').filter(Boolean));
       if (p === '/api/frame' && req.method === 'POST') return await handleFramePost(req, res);
@@ -351,29 +560,47 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function startMain() {
-  server.listen(PORT, HOST, () => {
-    const shown = HOST === '0.0.0.0' ? '127.0.0.1' : HOST;
-    const link = `http://${shown}:${PORT}/`;
-    console.log('===============================================');
-    console.log('  Tavern Card Translator đang chạy tại: ' + link);
-    console.log(frameReady ? `  Xem trước iframe: cổng ${FRAME_PORT}` : '  (Xem trước iframe dùng chế độ sandbox dự phòng)');
-    console.log('  (Đóng cửa sổ này để tắt app)');
-    console.log('===============================================');
-    if (!NO_OPEN) {
-      const cmd = process.platform === 'win32' ? `start "" "${link}"` : process.platform === 'darwin' ? `open "${link}"` : `xdg-open "${link}"`;
-      exec(cmd, () => {});
-    }
+// sau khi tự cập nhật, tiến trình mới có thể phải đợi tiến trình cũ nhả cổng -> thử lại vài lần
+const RESTARTED = process.env.TCT_RESTART === '1';
+function listenOnce(srv, port) {
+  return new Promise((resolve, reject) => {
+    const onErr = (e) => { srv.off('listening', onOk); reject(e); };
+    const onOk = () => { srv.off('error', onErr); resolve(); };
+    srv.once('error', onErr);
+    srv.once('listening', onOk);
+    srv.listen(port, HOST);
   });
 }
-server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') console.error(`Cổng ${PORT} đang bị dùng (có thể app đã đang chạy). Chạy với cổng khác: node server.js --port 8690`);
-  else logError(e);
-  process.exit(1);
-});
-frameServer.once('error', (e) => {
-  frameReady = false;
-  logError(`Không mở được cổng ${FRAME_PORT} cho iframe xem trước (${e.code}) — dùng chế độ sandbox dự phòng.`);
-  startMain();
-});
-frameServer.listen(FRAME_PORT, HOST, () => { frameReady = true; startMain(); });
+async function listenRetry(srv, port) {
+  for (let i = 0; ; i++) {
+    try { return await listenOnce(srv, port); } catch (e) {
+      if (e.code !== 'EADDRINUSE' || !RESTARTED || i >= 30) throw e;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+}
+
+(async () => {
+  try { await listenRetry(frameServer, FRAME_PORT); frameReady = true; } catch (e) {
+    frameReady = false;
+    logError(`Không mở được cổng ${FRAME_PORT} cho iframe xem trước (${e.code}) — dùng chế độ sandbox dự phòng.`);
+  }
+  try { await listenRetry(server, PORT); } catch (e) {
+    if (e.code === 'EADDRINUSE') console.error(`Cổng ${PORT} đang bị dùng (có thể app đã đang chạy). Chạy với cổng khác: node server.js --port 8690`);
+    else logError(e);
+    process.exit(1);
+  }
+  server.on('error', (e) => logError('[server]', e));
+  frameServer.on('error', (e) => logError('[frame]', e));
+  const shown = HOST === '0.0.0.0' ? '127.0.0.1' : HOST;
+  const link = `http://${shown}:${PORT}/`;
+  console.log('===============================================');
+  console.log(`  Tavern Card Translator v${APP_VERSION} đang chạy tại: ` + link);
+  console.log(frameReady ? `  Xem trước iframe: cổng ${FRAME_PORT}` : '  (Xem trước iframe dùng chế độ sandbox dự phòng)');
+  console.log('  (Đóng cửa sổ này để tắt app)');
+  console.log('===============================================');
+  if (!NO_OPEN) {
+    const cmd = process.platform === 'win32' ? `start "" "${link}"` : process.platform === 'darwin' ? `open "${link}"` : `xdg-open "${link}"`;
+    exec(cmd, () => {});
+  }
+})();

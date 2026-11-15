@@ -148,8 +148,41 @@ export function listItems(card) {
     if (folder) continue;
     if (typeof script.content === 'string') add({ path: [...path, 'content'], group: 'scripts', label: `Mã script: ${title}`, kind: isSchemaScript(script.content) ? 'schema' : 'code', text: script.content, meta });
     if (typeof script.info === 'string' && script.info) add({ path: [...path, 'info'], group: 'scripts', label: `Mô tả script: ${title}`, kind: 'auto', text: script.info, meta });
+    // nút của script: chỉ đổi tên nút mà chính script này lắng nghe bằng getButtonEvent('tên') — tên nút và lời gọi
+    // được đổi cùng nhau theo từ điển. Nút của MVU (重新处理变量…) do bundle từ xa xử lý -> giữ nguyên.
+    const btnList = Array.isArray(script.button?.buttons) ? script.button.buttons : Array.isArray(script.buttons) ? script.buttons : null;
+    const btnBase = Array.isArray(script.button?.buttons) ? [...path, 'button', 'buttons'] : [...path, 'buttons'];
+    (btnList || []).forEach((b, j) => {
+      if (b && typeof b.name === 'string' && hasCJK(b.name) && scriptListensButton(script.content, b.name)) {
+        add({ path: [...btnBase, j, 'name'], group: 'scripts', label: `Nút: ${b.name} (${title})`, kind: 'button', text: b.name, meta: { ...meta, button: true } });
+      }
+    });
+    // dữ liệu riêng của script (biến script)
+    if (isPlainObject(script.data) && hasCJK(JSON.stringify(script.data))) {
+      add({ path: [...path, 'data'], group: 'scripts', label: `Dữ liệu script: ${title}`, kind: 'json', text: JSON.stringify(script.data, null, 2), meta: { ...meta, json: true, root: 'script.data' } });
+    }
   }
+  // biến nhân vật của Tavern Helper
+  const thVars = d.extensions?.tavern_helper?.variables;
+  if (isPlainObject(thVars) && hasCJK(JSON.stringify(thVars))) {
+    add({ path: ['data', 'extensions', 'tavern_helper', 'variables'], group: 'scripts', label: 'Biến nhân vật (Tavern Helper)', kind: 'json', text: JSON.stringify(thVars, null, 2), meta: { json: true, root: 'tavern_helper.variables' } });
+  }
+  // trimStrings của regex (đồng bộ nhãn)
+  (d.extensions?.regex_scripts || []).forEach((r, i) => {
+    if (r && Array.isArray(r.trimStrings) && r.trimStrings.some(hasCJK)) {
+      add({ path: ['data', 'extensions', 'regex_scripts', i, 'trimStrings'], group: 'regex', label: `Trim: ${r.scriptName || `Regex #${i + 1}`}`, kind: 'trimList', text: r.trimStrings.slice(), meta: { regexIndex: i } });
+    }
+  });
   return items;
+}
+
+function isPlainObject(o) { return !!o && typeof o === 'object' && !Array.isArray(o) && Object.keys(o).length > 0; }
+
+/** Script có gọi getButtonEvent('tên nút') với đúng tên này không */
+export function scriptListensButton(content, name) {
+  if (typeof content !== 'string' || !content.includes('getButtonEvent')) return false;
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('getButtonEvent\\s*\\(\\s*([\'"`])' + esc + '\\1\\s*\\)').test(content);
 }
 
 /** Ghép card đã dịch. outputs: Map(itemId -> giá trị mới) */
@@ -158,7 +191,12 @@ export function buildTranslatedCard(card, outputs) {
   const items = listItems(card);
   for (const it of items) {
     if (!outputs.has(it.id)) continue;
-    setPath(out, it.path, outputs.get(it.id));
+    let v = outputs.get(it.id);
+    if (it.kind === 'json') {
+      // dữ liệu JSON (biến Tavern Helper…): đọc lại object; lỗi thì giữ bản gốc
+      try { v = JSON.parse(v); } catch { continue; }
+    }
+    setPath(out, it.path, v);
   }
   const d = out.data;
   // đồng bộ tên lorebook với extensions.world

@@ -1,10 +1,10 @@
 // Dự án dịch: gắn card + từ điển + bộ nhớ dịch (TM) + chỉnh tay; phân tích, render, xuất card.
 import { makeCard, listItems, buildTranslatedCard, exportCardJson, exportCardPng } from './core/card.js';
 import { scanCard, mergeScan, makeDictIndex, findConflicts } from './core/dict.js';
-import { analyzeItem } from './core/analyze.js';
+import { analyzeItem, findDynamicEntryRefs } from './core/analyze.js';
 import { validateSegment, allowedHanSet } from './core/translate.js';
 import { uuid, hasCJK, deepClone } from './core/util.js';
-import { utf8ToBase64 } from './core/png.js';
+import { utf8ToBase64, verifyPng, isPng } from './core/png.js';
 
 export const DEFAULT_TRANSLATE_SETTINGS = {
   usePresetPrompts: false,
@@ -22,7 +22,8 @@ export const DEFAULT_TRANSLATE_SETTINGS = {
   keysMode: 'append',
   codeStrings: 'smart',
   ejsStrings: false,
-  comments: false,
+  comments: true,
+  autoFixConflicts: true,
   userName: 'User',
   translateCardName: true,
   translateTags: true,
@@ -126,6 +127,9 @@ export class Project {
     const bookItem = this.items.find((it) => it.path.join('.') === 'data.character_book.name');
     const bookNames = new Set(bookItem ? [bookItem.text] : []);
     this.bookItem = bookItem;
+    // tên mục lorebook bị EJS/script ghép động (getwi(null, sách + ' / 第' + n + '章')) -> phải giữ nguyên
+    const dyn = findDynamicEntryRefs(this.items.map((it) => it.text), entryNames);
+    this.pinnedEntries = dyn.pinned;
     const ctx = {
       dict: idx,
       entryNames: settings.translateComments ? entryNames : new Set(),
@@ -134,8 +138,13 @@ export class Project {
     };
     this.analyses = new Map();
     this.segByKey = new Map();
+    const pinNote = 'Tên mục này được EJS/script ghép động (vd getwi(null, tênSách + " / 第" + n + "章")) nên được giữ nguyên để mã vẫn tìm thấy mục.';
+    const dynNote = dyn.dynamic.length ? `Có lời gọi getwi()/activewi() lấy tên mục lorebook từ biến (${dyn.dynamic.slice(0, 3).join(' · ')}) — nếu mục không được tìm thấy sau khi dịch, hãy tắt "Dịch tên mục lorebook" ở tab Cài đặt dịch.` : null;
     for (const it of this.items) {
-      const a = analyzeItem(it, ctx);
+      const a = it.kind === 'comment' && this.pinnedEntries.has(it.text)
+        ? { segments: [], warnings: [pinNote], render: () => it.text, pinned: true }
+        : analyzeItem(it, ctx);
+      if (dynNote && typeof it.text === 'string' && /getwi|getWorldInfo|activewi|activateWorldInfo/.test(it.text) && !a.warnings.includes(dynNote)) a.warnings.push(dynNote);
       this.analyses.set(it.id, a);
       for (const s of a.segments) {
         let e = this.segByKey.get(s.key);
@@ -159,8 +168,9 @@ export class Project {
       if (p.includes('scripts')) return !!settings.translateScriptNames;
       return true;
     }
-    if (it.kind === 'comment') return !!settings.translateComments;
+    if (it.kind === 'comment') return !!settings.translateComments && !this.pinnedEntries?.has(it.text);
     if (it.kind === 'list') return !!settings.translateTags;
+    if (it.kind === 'button') return !!settings.translateScriptNames;
     if (p.endsWith('.info')) return !!settings.translateScriptInfo;
     return true;
   }
@@ -281,7 +291,19 @@ export class Project {
   exportPng(settings, fallbackImage) {
     const img = this.card.image || fallbackImage;
     if (!img) throw new Error('Card gốc không có ảnh PNG');
-    return exportCardPng(img, this.buildCard(settings));
+    const out = exportCardPng(img, this.buildCard(settings));
+    // tự kiểm tra như SillyTavern (CRC, IHDR/IEND, chunk tEXt) trước khi cho tải về
+    const v = verifyPng(out);
+    if (!v.ok) throw new Error('File PNG tạo ra không hợp lệ (' + v.error + ')');
+    return out;
+  }
+
+  /** Đổi ảnh card (bytes PNG) — null = bỏ ảnh, xuất PNG sẽ dùng ảnh tạm */
+  setImage(bytes) {
+    if (bytes && !isPng(bytes)) throw new Error('Ảnh phải là PNG');
+    this.card.image = bytes || null;
+    this.data.imageB64 = bytes ? bytesToB64(bytes) : null;
+    this.touch();
   }
 
   toJSON() {

@@ -13,17 +13,19 @@ function crcTable() {
   }
   return CRC_TABLE;
 }
-export function crc32(bytes, start = 0, end = bytes.length, crc = 0xffffffff) {
+/** CRC-32 chuẩn PNG (ISO-HDLC): khởi tạo 0xFFFFFFFF và đảo bit ở cuối */
+export function crc32(bytes, start = 0, end = bytes.length) {
   const t = crcTable();
+  let crc = 0xffffffff;
   for (let i = start; i < end; i++) crc = t[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  return crc >>> 0;
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 export function isPng(bytes) {
   return bytes && bytes.length > 8 && PNG_SIG.every((b, i) => bytes[i] === b);
 }
 
-/** Tách các chunk PNG */
+/** Tách các chunk PNG (dễ dãi: không kiểm CRC, để đọc được cả file hơi lỗi) */
 export function extractChunks(bytes) {
   if (!isPng(bytes)) throw new Error('Không phải file PNG hợp lệ');
   const chunks = [];
@@ -32,12 +34,50 @@ export function extractChunks(bytes) {
   while (pos + 8 <= bytes.length) {
     const len = dv.getUint32(pos);
     const name = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
-    const data = bytes.subarray(pos + 8, pos + 8 + len);
+    const data = bytes.subarray(pos + 8, Math.min(bytes.length, pos + 8 + len));
     chunks.push({ name, data });
     pos += 12 + len;
     if (name === 'IEND') break;
   }
   return chunks;
+}
+
+/**
+ * Kiểm tra PNG nghiêm ngặt giống SillyTavern (png-chunks-extract + png-chunk-text):
+ * IHDR đứng đầu, CRC từng chunk đúng, có IEND, chunk tEXt không chứa byte 0 trong phần chữ, có dữ liệu card.
+ * Trả về { ok, error }
+ */
+export function verifyPng(bytes) {
+  try {
+    if (!isPng(bytes)) return { ok: false, error: 'sai chữ ký PNG' };
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let pos = 8, first = true, ended = false, card = false;
+    while (pos < bytes.length) {
+      if (pos + 12 > bytes.length) return { ok: false, error: 'chunk bị cắt cụt' };
+      const len = dv.getUint32(pos);
+      const name = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+      if (first && name !== 'IHDR') return { ok: false, error: 'thiếu IHDR ở đầu' };
+      first = false;
+      if (pos + 12 + len > bytes.length) return { ok: false, error: `chunk ${name} vượt quá cuối file` };
+      if (name === 'IEND') { ended = true; break; }
+      const want = dv.getUint32(pos + 8 + len);
+      const got = crc32(bytes, pos + 4, pos + 8 + len);
+      if (want !== got) return { ok: false, error: `CRC chunk ${name} sai` };
+      if (name === 'tEXt') {
+        const data = bytes.subarray(pos + 8, pos + 8 + len);
+        const z = data.indexOf(0);
+        if (z >= 0 && data.indexOf(0, z + 1) >= 0) return { ok: false, error: 'chunk tEXt chứa ký tự NULL' };
+        const kw = latin1Decode(data.subarray(0, z < 0 ? data.length : z)).toLowerCase();
+        if (kw === 'chara' || kw === 'ccv3') card = true;
+      }
+      pos += 12 + len;
+    }
+    if (!ended) return { ok: false, error: 'thiếu chunk IEND' };
+    if (!card) return { ok: false, error: 'không có chunk chara/ccv3' };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
 }
 
 export function encodeChunks(chunks) {

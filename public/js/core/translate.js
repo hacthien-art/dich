@@ -3,7 +3,7 @@ import { chat } from './api.js';
 import { buildMessages } from './preset.js';
 import { PH_RE } from './analyze.js';
 import { countCJK, hasCJK, sleep, HAN_CLASS } from './util.js';
-import { glossaryFor, makeDictIndex, applyStyle, sanitizeName } from './dict.js';
+import { glossaryFor, makeDictIndex, applyStyle, sanitizeName, findConflicts } from './dict.js';
 
 export const NAME_RULES = {
   auto: 'Tên người gốc Trung → âm Hán Việt (vd: 李明 → Lý Minh); tên Nhật → phiên âm romaji (vd: 高松灯 → Takamatsu Tomori); tên phương Tây giữ dạng Latin gốc; nếu văn bản đã ghi phiên âm trong ngoặc thì ưu tiên phiên âm đó. Địa danh/tổ chức Trung → Hán Việt.',
@@ -26,7 +26,7 @@ QUY TẮC BẮT BUỘC:
 8. Nếu thẻ <seg> có thuộc tính note thì đó là lỗi của lần dịch trước — phải sửa đúng lỗi đó.
 9. Chỉ trả về kết quả theo đúng định dạng được yêu cầu, không giải thích.`,
   task: `Card: {{card_name}}
-Loại đoạn: prose = văn bản/chỉ dẫn; ui = chữ trên giao diện HTML (ngắn gọn); name = tên/tiêu đề; keyword = từ khóa kích hoạt lorebook (ngắn, dễ khớp); desc = mô tả biến cho AI.
+Loại đoạn: prose = văn bản/chỉ dẫn; ui = chữ trên giao diện HTML (ngắn gọn); name = tên/tiêu đề; keyword = từ khóa kích hoạt lorebook (ngắn, dễ khớp); desc = mô tả biến cho AI; comment = chú thích trong mã nguồn (ngắn gọn, giữ 1 dòng nếu bản gốc 1 dòng).
 
 Bảng thuật ngữ (bắt buộc dùng đúng):
 {{glossary}}
@@ -47,7 +47,18 @@ Trả về mỗi mục trong thẻ <item id="..."> với CÙNG id, chỉ chứa 
 {{items}}`,
 };
 
-const TYPE_ATTR = { prose: 'prose', ui: 'ui', name: 'name', keyword: 'keyword', desc: 'desc' };
+const TYPE_ATTR = { prose: 'prose', ui: 'ui', name: 'name', keyword: 'keyword', desc: 'desc', comment: 'comment' };
+
+export const CONFLICT_PROMPT = `Trong card "{{card_name}}", các tên biến (khóa dữ liệu MVU / JSON) dưới đây đang bị dịch TRÙNG tên với một biến khác trong cùng object cha — dữ liệu sẽ ghi đè lên nhau và card bị hỏng.
+Hãy đặt lại tên tiếng Việt cho từng <item>:
+- Dịch đúng và ĐỦ nghĩa của từ gốc, cụ thể tới mức phân biệt được với các biến cùng nhóm (vd: 减粮 → Giảm lương thực, 减饷 → Giảm quân lương; 动向 → Xu hướng, 动态 → Động thái; 余额 → Số dư, 余量 → Lượng còn lại).
+- Ngắn gọn (1-5 từ), không dùng các ký tự . / [ ] : # ' " \`
+- Tên mới KHÔNG được trùng nhau, không trùng tên trong <keep> và các tên liệt kê ở thuộc tính used của cùng nhóm.{{style_note}}
+Tên riêng: {{name_rule}}
+
+Trả về mỗi mục trong thẻ <item id="..."> với CÙNG id, chỉ chứa tên mới, không giải thích.
+
+{{items}}`;
 
 function escAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
@@ -326,6 +337,145 @@ export async function suggestDict(job, entries) {
   };
   await Promise.all(Array.from({ length: concurrency }, worker));
   return { done };
+}
+
+// ====================================================================== xung đột tên biến
+
+/** Tên đang dùng (sau kiểu đặt tên) của các khóa thuộc object cha `parent`, bỏ qua các khóa trong `exclude` */
+function namesUnder(dict, settings, parent, exclude) {
+  const idx = makeDictIndex(dict, settings);
+  const out = new Set();
+  for (const [src, v] of Object.entries(dict || {})) {
+    if (v.kind !== 'key' || exclude?.has(src)) continue;
+    const ps = v.parents?.length ? v.parents : [''];
+    if (ps.includes(parent)) out.add(idx.lookup(src));
+  }
+  return out;
+}
+
+/**
+ * Lập kế hoạch sửa xung đột: mỗi nhóm giữ tên cho 1 mục (mục sửa tay nếu không phải tất cả đều sửa tay,
+ * ngược lại mục dùng nhiều nhất), các mục còn lại cần đặt tên mới.
+ * Trả về [{ parent, keep:[src], rename:[src] }]
+ */
+export function planConflicts(dict, conflicts) {
+  const groups = [];
+  const seen = new Set();
+  for (const c of conflicts) {
+    const members = c.srcs.filter((s) => dict[s]);
+    if (members.length < 2) continue;
+    const manual = members.filter((s) => dict[s].manual);
+    const keep = manual.length && manual.length < members.length
+      ? manual
+      : [members.slice().sort((a, b) => (dict[b].count || 0) - (dict[a].count || 0) || a.localeCompare(b))[0]];
+    const rename = members.filter((s) => !keep.includes(s) && !seen.has(s));
+    rename.forEach((s) => seen.add(s));
+    if (rename.length) groups.push({ parent: c.parent, dst: c.dst, keep, rename });
+  }
+  return groups;
+}
+
+/** Hậu tố số cho các khóa vẫn còn trùng (bảo đảm khác nhau tuyệt đối). Trả về danh sách thay đổi */
+export function suffixConflicts(dict, settings) {
+  const changes = [];
+  for (let guard = 0; guard < 6; guard++) {
+    const conflicts = findConflicts(dict, settings);
+    if (!conflicts.length) break;
+    for (const g of planConflicts(dict, conflicts)) {
+      const style = settings.namingStyle || 'natural';
+      for (const src of g.rename) {
+        const e = dict[src];
+        const used = new Set();
+        for (const p of e.parents?.length ? e.parents : ['']) for (const n of namesUnder(dict, settings, p, new Set([src]))) used.add(n);
+        const from = makeDictIndex(dict, settings).lookup(src);
+        const base = String(e.dst || src).replace(/[\s_]*\d+$/, '').trim() || src;
+        let k = 2, cand = '';
+        do { cand = `${base} ${k++}`; } while (used.has(applyStyle(cand, style, 'key', src)) && k < 200);
+        e.dst = cand; e.auto = true; e.manual = false;
+        changes.push({ src, from, to: makeDictIndex(dict, settings).lookup(src) });
+      }
+    }
+  }
+  return changes;
+}
+
+/**
+ * Tự dịch lại các biến bị trùng tên bằng AI (tối đa `rounds` vòng), còn trùng thì thêm hậu tố số.
+ * job: { settings, conn, preset, cardName, signal, onLog, onStream }
+ * dict: từ điển của dự án (được sửa trực tiếp). useAI=false -> chỉ thêm hậu tố.
+ * Trả về { renamed:[{src,from,to}], suffixed:[{src,from,to}], remaining: conflicts[] }
+ */
+export async function resolveConflicts(job, dict, { rounds = 2, useAI = true } = {}) {
+  const st = job.settings || {};
+  const prompts = { ...DEFAULT_PROMPTS, ...(st.prompts || {}) };
+  const nameRule = NAME_RULES[st.nameStyle || 'auto'];
+  const style = st.namingStyle || 'natural';
+  const styleNote = style === 'snake' || style === 'camel' ? '\n- Tên biến sẽ được BỎ DẤU (kiểu đặt tên không dấu) nên các tên phải khác nhau cả khi bỏ dấu tiếng Việt (vd "Năm" và "Nam" bị coi là trùng).' : '';
+  const renamed = [];
+  const notes = new Map();
+  for (let round = 0; round < rounds && useAI; round++) {
+    if (job.signal?.aborted) break;
+    const conflicts = findConflicts(dict, st);
+    if (!conflicts.length) break;
+    const groups = planConflicts(dict, conflicts);
+    // chia lô theo nhóm, mỗi lô <= 50 mục
+    const batches = [];
+    let cur = [], n = 0;
+    for (const g of groups) {
+      if (cur.length && n + g.rename.length > 50) { batches.push(cur); cur = []; n = 0; }
+      cur.push(g); n += g.rename.length;
+    }
+    if (cur.length) batches.push(cur);
+    job.onLog?.(`Xung đột tên biến: ${conflicts.length} nhóm → AI đặt lại ${groups.reduce((x, g) => x + g.rename.length, 0)} tên (vòng ${round + 1})`, 'info');
+    for (const batch of batches) {
+      if (job.signal?.aborted) break;
+      const idx = makeDictIndex(dict, st);
+      const ids = [];
+      const parts = batch.map((g) => {
+        const members = new Set([...g.keep, ...g.rename]);
+        const used = [...namesUnder(dict, st, g.parent, members)].slice(0, 40);
+        const lines = [`<group ctx="${escAttr(g.parent || '(gốc)')}"${used.length ? ` used="${escAttr(used.join(' | '))}"` : ''}>`];
+        for (const s of g.keep) lines.push(`<keep src="${escAttr(s)}">${idx.lookup(s)}</keep>`);
+        for (const s of g.rename) {
+          ids.push(s);
+          const note = notes.get(s);
+          lines.push(`<item id="${ids.length}" now="${escAttr(idx.lookup(s))}"${note ? ` note="${escAttr(note)}"` : ''}>${s}</item>`);
+        }
+        lines.push('</group>');
+        return lines.join('\n');
+      }).join('\n\n');
+      const content = fillTemplate(prompts.conflict || CONFLICT_PROMPT, { card_name: job.cardName || '', name_rule: nameRule, items: parts }).replace('{{style_note}}', styleNote);
+      const messages = buildMessages(job.preset || {}, {
+        usePresetPrompts: !!st.usePresetPrompts,
+        systemPrompt: 'Bạn là dịch giả Trung → Việt chuyên Việt hóa card SillyTavern. Chỉ trả về đúng định dạng được yêu cầu.',
+        taskMessages: [{ role: 'user', content }],
+        macro: { user: st.userName || 'User', char: job.cardName || 'Character' },
+        provider: job.conn?.provider,
+        applyPrefill: !!st.applyPrefill,
+      });
+      try {
+        const res = await chat(job.conn, job.preset, messages, { signal: job.signal, onDelta: (t) => job.onStream?.('conflict', t) });
+        const parsed = parseTagged(res.text, 'item');
+        ids.forEach((src, i) => {
+          const v = parsed.get(i + 1);
+          if (v == null || !v.trim()) return;
+          const e = dict[src];
+          const from = makeDictIndex(dict, st).lookup(src);
+          const name = sanitizeName(v.trim(), 'key');
+          if (!name || name === e.dst) { notes.set(src, `tên "${from}" vẫn bị trùng — hãy chọn tên khác hẳn`); return; }
+          e.dst = name; e.auto = true; e.manual = false;
+          renamed.push({ src, from, to: makeDictIndex(dict, st).lookup(src) });
+        });
+      } catch (e) {
+        if (job.signal?.aborted || e.name === 'AbortError') break;
+        job.onLog?.('Lỗi khi nhờ AI sửa tên biến trùng: ' + e.message, 'warn');
+        if (e.status === 401 || e.status === 403) throw e;
+      }
+    }
+    for (const c of findConflicts(dict, st)) for (const s of c.srcs) if (!notes.has(s)) notes.set(s, `lần trước vẫn trùng tên "${c.dst}" — hãy chọn tên khác hẳn`);
+  }
+  const suffixed = job.signal?.aborted ? [] : suffixConflicts(dict, st);
+  return { renamed, suffixed, remaining: findConflicts(dict, st) };
 }
 
 export { makeDictIndex, applyStyle, hasCJK };

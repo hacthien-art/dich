@@ -17,3 +17,7 @@ node_modules/
 *.log
 Thumbs.db
 .DS_Store
+
+# Bản cài từ zip: sha phiên bản (do nút Cập nhật ghi) và file tạm khi cập nhật
+version.json
+*.upd-tmp

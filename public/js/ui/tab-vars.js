@@ -1,12 +1,20 @@
 // Tab Biến & Đồng bộ: bảng ánh xạ tên biến / giá trị / nhãn / thuật ngữ, kiểm tra schema Zod với InitVar
 import { h, clear, toast, field, select, confirmBox, add } from './dom.js';
-import { NAMING_STYLES, makeDictIndex, applyStyle } from '../core/dict.js';
+import { NAMING_STYLES, makeDictIndex, applyStyle, stripAccents } from '../core/dict.js';
 import { NAME_RULES } from '../core/translate.js';
 import { runDictSuggest } from '../app.js';
 import { load as yamlLoad } from '../../vendor/js-yaml.mjs';
 import { validateSchema } from '../preview/sandbox.js';
 
 const KIND_NAMES = { key: 'Tên biến', value: 'Giá trị', marker: 'Nhãn regex', term: 'Thuật ngữ' };
+
+/** Chuẩn hóa để tìm: chữ thường, bỏ dấu tiếng Việt (gõ "do hao cam" vẫn ra "Độ hảo cảm") */
+const normQ = (s) => stripAccents(String(s || '').toLowerCase()).trim();
+function entryMatches(src, v, idx, nq) {
+  if (normQ(src).includes(nq)) return true;
+  const hay = [v.dst, idx.lookup(src), ...(v.parents || []), ...(v.samples || [])];
+  return hay.some((x) => x && normQ(x).includes(nq));
+}
 
 export function create(app, el) {
   const self = { render };
@@ -44,19 +52,28 @@ export function create(app, el) {
     // ---------------------------------------------------------- xung đột
     const conflicts = p.conflicts(ts);
     const conflictBox = conflicts.length ? h('div', { class: 'card-box' },
-      h('h3', { class: 'err', style: { marginTop: 0 } }, `⚠ ${conflicts.length} xung đột tên biến`),
-      conflicts.slice(0, 20).map((c) => h('div', { class: 'conflict small' }, `Trong "${c.parent || '(gốc)'}": ${c.srcs.join(', ')} → cùng thành "${c.dst}". Hãy sửa để tên khác nhau.`))) : null;
+      h('div', { class: 'row', style: { marginBottom: '8px' } },
+        h('h3', { class: 'err', style: { margin: 0, flex: 1 } }, `⚠ ${conflicts.length} xung đột tên biến`),
+        h('button', { class: 'btn primary small', disabled: !!app.running || ts.varMode === 'keep', title: 'Gửi các biến bị trùng tên cho AI đặt lại tên khác nhau (giữ nguyên mục bạn đã sửa tay nếu được)', onclick: () => app.fixConflicts() }, `🤖 Tự dịch lại ${conflicts.reduce((n, c) => n + c.srcs.length, 0)} biến trùng`)),
+      h('div', { class: 'muted small', style: { marginBottom: '8px' } }, '2 biến khác nhau trong cùng object cha bị dịch thành cùng một tên → dữ liệu ghi đè lên nhau. App tự sửa sau khi gợi ý từ điển (tắt/bật ở tab Cài đặt dịch); nếu AI vẫn đặt trùng, app thêm hậu tố số để chắc chắn khác nhau.'),
+      conflicts.slice(0, 20).map((c) => h('div', { class: 'conflict small' }, `Trong "${c.parent || '(gốc)'}": ${c.srcs.join(', ')} → cùng thành "${c.dst}".`)),
+      conflicts.length > 20 ? h('div', { class: 'muted small' }, `… và ${conflicts.length - 20} xung đột khác`) : null) : null;
 
     // ---------------------------------------------------------- bảng từ điển
-    const idx = makeDictIndex(p.data.dict, ts);
     const entries = Object.entries(p.data.dict);
     const counts = { all: entries.length };
     for (const [, v] of entries) counts[v.kind] = (counts[v.kind] || 0) + 1;
-    const filtered = entries.filter(([src, v]) => (kindFilter === 'all' || v.kind === kindFilter) && (!q || src.includes(q) || (v.dst || '').toLowerCase().includes(q.toLowerCase())));
     const tableWrap = h('div', { class: 'table-wrap' });
     const pager = h('div', { class: 'row', style: { marginTop: '6px' } });
+    const foundEl = h('span', { class: 'muted small' });
     const renderTable = () => {
       clear(tableWrap); clear(pager);
+      const idx = makeDictIndex(p.data.dict, ts);
+      const nq = normQ(q);
+      const filtered = entries.filter(([src, v]) => (kindFilter === 'all' || v.kind === kindFilter) && (!nq || entryMatches(src, v, idx, nq)));
+      foundEl.textContent = nq ? `${filtered.length} kết quả` : '';
+      const pages = Math.max(1, Math.ceil(filtered.length / PAGE));
+      if (page >= pages) page = pages - 1;
       const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Gốc'), h('th', null, 'Loại'), h('th', { style: { width: '34%' } }, 'Bản dịch (sửa được)'), h('th', null, 'Kết quả dùng'), h('th', null, 'Giữ'), h('th', null, 'Ngữ cảnh')));
       const slice = filtered.slice(page * PAGE, (page + 1) * PAGE);
       for (const [src, v] of slice) {
@@ -80,16 +97,22 @@ export function create(app, el) {
           h('td', null, keep),
           h('td', { class: 'muted small' }, `${v.count}×`, v.parents?.length ? ' · ' + v.parents.slice(0, 2).join(' | ') : '', v.samples?.length && !v.parents?.length ? ' · ' + v.samples[0] : '')));
       }
+      if (!slice.length) tbl.appendChild(h('tr', null, h('td', { colspan: 6, class: 'muted' }, nq ? `Không có mục nào khớp "${q}"` : 'Không có mục nào')));
       tableWrap.appendChild(tbl);
-      const pages = Math.ceil(filtered.length / PAGE);
       if (pages > 1) {
         pager.append(h('span', { class: 'muted small' }, `Trang ${page + 1}/${pages}`),
           h('button', { class: 'btn small', disabled: page === 0, onclick: () => { page--; renderTable(); } }, '‹'),
           h('button', { class: 'btn small', disabled: page >= pages - 1, onclick: () => { page++; renderTable(); } }, '›'));
       }
     };
-    const search = h('input', { type: 'search', placeholder: 'Tìm…', value: q, style: { maxWidth: '240px' } });
-    search.addEventListener('input', () => { q = search.value.trim(); page = 0; render(); search.focus(); });
+    // Ô tìm kiếm: chỉ vẽ lại bảng (không vẽ lại cả tab -> không mất focus, gõ tiếng Việt/bộ gõ IME không bị ngắt)
+    const search = h('input', { type: 'search', placeholder: 'Tìm gốc / bản dịch / ngữ cảnh…', value: q, style: { maxWidth: '260px' } });
+    let composing = false, timer = 0;
+    const applySearch = () => { clearTimeout(timer); timer = setTimeout(() => { if (search.value.trim() === q) return; q = search.value.trim(); page = 0; renderTable(); }, 150); };
+    search.addEventListener('compositionstart', () => { composing = true; });
+    search.addEventListener('compositionend', () => { composing = false; applySearch(); });
+    search.addEventListener('input', () => { if (!composing) applySearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && search.value) { search.value = ''; applySearch(); } });
     const addRow = h('button', { class: 'btn small', onclick: () => {
       const src = prompt('Từ/cụm tiếng Trung cần thêm vào từ điển:');
       if (!src || !src.trim()) return;
@@ -102,7 +125,7 @@ export function create(app, el) {
       h('div', { class: 'row', style: { marginBottom: '8px' } },
         h('h3', { style: { margin: 0, flex: 1 } }, 'Bảng đồng bộ (biến · giá trị · nhãn · thuật ngữ)'),
         ...['all', 'key', 'value', 'marker', 'term'].map((k) => h('button', { class: 'btn small' + (kindFilter === k ? ' primary' : ''), onclick: () => { kindFilter = k; page = 0; render(); } }, `${k === 'all' ? 'Tất cả' : KIND_NAMES[k]} (${counts[k] || 0})`)),
-        search, addRow),
+        search, foundEl, addRow),
       h('div', { class: 'muted small', style: { marginBottom: '8px' } },
         'Mỗi mục được thay đồng loạt ở mọi nơi trong card (thay theo vị trí đã phân tích, không thay chuỗi mù). Đổi bản dịch ở đây → bản dịch card cập nhật ngay, không cần gọi lại AI. ',
         h('b', null, 'Kết quả dùng'), ' = tên sau khi áp dụng kiểu đặt tên.'),

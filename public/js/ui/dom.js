@@ -96,6 +96,22 @@ export async function readFileBytes(file) {
   return new Uint8Array(await file.arrayBuffer());
 }
 
+/** Đọc file ảnh bất kỳ (PNG/JPG/WebP/GIF...) -> byte PNG (PNG giữ nguyên, định dạng khác vẽ lại qua canvas) */
+export async function imageToPng(file) {
+  const bytes = await readFileBytes(file);
+  const isPngSig = bytes.length > 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((b, i) => bytes[i] === b);
+  if (isPngSig) return bytes;
+  let bmp;
+  try { bmp = await createImageBitmap(new Blob([bytes], { type: file.type || 'image/*' })); } catch { throw new Error('không đọc được định dạng ảnh'); }
+  const c = document.createElement('canvas');
+  c.width = bmp.width; c.height = bmp.height;
+  c.getContext('2d').drawImage(bmp, 0, 0);
+  bmp.close?.();
+  const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+  if (!blob) throw new Error('không chuyển được sang PNG');
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
 export function field(label, control, hint) {
   return h('label', { class: 'field' }, h('span', { class: 'lbl' }, label), control, hint ? h('div', { class: 'hint' }, hint) : null);
 }

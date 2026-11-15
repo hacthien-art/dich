@@ -1,11 +1,11 @@
 // Tab Card: cây các phần của card, so sánh gốc/bản dịch, sửa từng đoạn, dịch từng mục
-import { h, clear, toast, confirmBox, add } from './dom.js';
+import { h, clear, toast, confirmBox, add, pickFile, imageToPng } from './dom.js';
 import { GROUPS } from '../core/card.js';
 import { PH_RE } from '../core/analyze.js';
 import { validateSegment, allowedHanSet } from '../core/translate.js';
 import { formatBytes } from '../core/util.js';
 
-const KIND_LABEL = { name: 'tên', auto: 'văn bản/HTML', initvar: 'InitVar (biến khởi tạo)', code: 'mã script', schema: 'schema Zod', regexFind: 'find regex', keys: 'từ khóa', comment: 'tên mục', list: 'danh sách' };
+const KIND_LABEL = { name: 'tên', auto: 'văn bản/HTML', initvar: 'InitVar (biến khởi tạo)', code: 'mã script', schema: 'schema Zod', regexFind: 'find regex', keys: 'từ khóa', comment: 'tên mục', list: 'danh sách', button: 'nút script (đồng bộ getButtonEvent)', json: 'dữ liệu JSON (biến Tavern Helper)', trimList: 'trim strings của regex' };
 const STATE_LABEL = { done: 'đã dịch', partial: 'dịch một phần', todo: 'chưa dịch', warn: 'đã dịch (có cảnh báo)', manual: 'chỉnh tay', sync: 'chỉ đồng bộ biến', excluded: 'không dịch', none: 'không cần dịch' };
 
 export function create(app, el) {
@@ -14,7 +14,32 @@ export function create(app, el) {
   let filter = '';
   let onlyTodo = false;
   const collapsed = new Set(['scripts']);
-  let treeEl, editorEl, avatarUrl;
+  let treeEl, editorEl;
+  // URL ảnh đại diện gắn với đúng mảng byte ảnh của card hiện tại (nhập card khác / đổi ảnh -> tạo lại)
+  let avatarUrl = null, avatarOf = null;
+  function avatarFor(p) {
+    const img = p?.card?.image || null;
+    if (img !== avatarOf) {
+      if (avatarUrl) URL.revokeObjectURL(avatarUrl);
+      avatarUrl = img ? URL.createObjectURL(new Blob([img], { type: 'image/png' })) : null;
+      avatarOf = img;
+    }
+    return avatarUrl;
+  }
+
+  async function changeImage() {
+    const p = app.project;
+    if (!p) return;
+    const file = await pickFile('image/png,image/jpeg,image/webp,image/gif,image/bmp,.png,.jpg,.jpeg,.webp,.gif,.bmp');
+    if (!file) return;
+    try {
+      const bytes = await imageToPng(file);
+      p.setImage(bytes);
+      app.saveProject();
+      toast('Đã đổi ảnh card — ảnh này sẽ được dùng khi xuất PNG', 'ok');
+      if (!selected) renderEditor();
+    } catch (e) { toast('Không dùng được ảnh này: ' + e.message, 'err', 6000); }
+  }
 
   function render() {
     clear(el);
@@ -101,7 +126,7 @@ export function create(app, el) {
   function cardSummary() {
     const p = app.project;
     const d = p.card.raw.data;
-    if (p.card.image && !avatarUrl) avatarUrl = URL.createObjectURL(new Blob([p.card.image], { type: 'image/png' }));
+    const avatar = avatarFor(p);
     const st = p.stats();
     const dictN = Object.keys(p.data.dict).length;
     const book = d.character_book?.entries?.length || 0;
@@ -110,7 +135,10 @@ export function create(app, el) {
     const warns = [...new Set([...p.analyses.values()].flatMap((a) => a.warnings))];
     return h('div', null,
       h('div', { class: 'summary card-box' },
-        avatarUrl ? h('img', { src: avatarUrl, alt: '' }) : null,
+        h('div', { class: 'avatar-box' },
+          avatar ? h('img', { src: avatar, alt: '', title: 'Ảnh dùng khi xuất PNG' }) : h('div', { class: 'avatar-empty', title: 'Card gốc là JSON — xuất PNG sẽ dùng ảnh tạm' }, '🖼', h('div', { class: 'small' }, 'Chưa có ảnh')),
+          h('button', { class: 'btn small', onclick: changeImage, title: 'Chọn ảnh PNG/JPG/WebP để dùng khi xuất card PNG' }, avatar ? '🖼 Đổi ảnh' : '🖼 Thêm ảnh'),
+          avatar && p.card.format !== 'png' ? h('button', { class: 'btn small ghost', onclick: () => { p.setImage(null); app.saveProject(); renderEditor(); } }, '✕ Bỏ ảnh') : null),
         h('div', { style: { flex: 1 } },
           h('h2', null, d.name || '(không tên)'),
           h('div', { class: 'muted small' }, `${p.card.spec.toUpperCase()} · ${p.card.format.toUpperCase()} · ${p.data.fileName}`),
