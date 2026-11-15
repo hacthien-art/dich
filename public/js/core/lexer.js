@@ -289,6 +289,20 @@ export function lexCss(src, start = 0, end = src.length) {
       tokens.push({ type: 'comment', start: i, end: j });
       i = j; oStart = i; continue;
     }
+    // chuỗi có dấu nháy bị escape bên trong chuỗi JS: \"...\" hoặc \'...\'
+    if (c === '\\' && (src[i + 1] === '"' || src[i + 1] === "'")) {
+      flush(i);
+      const q = src[i + 1];
+      let j = i + 2;
+      while (j < end && src[j] !== '\n') {
+        if (src[j] === '\\' && src[j + 1] === q) break;
+        if (src[j] === '\\') j++;
+        j++;
+      }
+      const close = j + 1 < end && src[j] === '\\' && src[j + 1] === q;
+      tokens.push({ type: 'str', start: i, end: close ? j + 2 : j, quote: q, cStart: i + 2, cEnd: j });
+      i = close ? j + 2 : j; oStart = i; continue;
+    }
     if (c === '"' || c === "'") {
       flush(i);
       let j = i + 1;

@@ -49,5 +49,18 @@ eq(s4.includes("data['Nhân vật']['Độ hảo cảm']"), true, 'truy cập th
 eq(s4.includes("'.Độ hảo cảm'"), true, 'chuỗi đường dẫn được đổi');
 eq(compiles(s4), true, 'mã sau đổi tên biến vẫn hợp lệ');
 
+// 5) chuỗi CSS/base64 1.26 MB trong script (nhúng font WOFF2 + có chữ Hán) không gây treo O(N^2)
+{
+  const b64 = 'A'.repeat(1261031);
+  const bigCode = `const css = "@font-face{font-family:\\"TW Print Kesong\\";src:url(\\"data:font/woff2;base64,${b64}\\")}.paper{content:\\"号外\\"}" /* 开屏报纸 */;`;
+  const t0 = Date.now();
+  const r5 = run(bigCode, (k) => k.replace(/号外/, 'Số đặc biệt'), {}, 'code');
+  const elapsed = Date.now() - t0;
+  eq(elapsed < 500, true, `phân tích chuỗi base64 1.26 MB trong ${elapsed}ms (< 500ms, tuyến tính O(N))`);
+  eq(r5.same === bigCode, true, 'render không dịch giữ nguyên 100% chuỗi 1.26 MB');
+  eq(r5.a.segments.map((s) => s.key), ['号外'], 'chỉ trích xuất chữ trong content CSS, không cắt base64 thành đoạn dịch');
+  eq(r5.tr.includes('content:\\"Số đặc biệt\\"') && r5.tr.includes(b64), true, 'dịch đúng chữ trong CSS và giữ nguyên khối base64');
+}
+
 console.log(fails ? fails + ' lỗi' : 'analyze OK');
 process.exit(fails ? 1 : 0);

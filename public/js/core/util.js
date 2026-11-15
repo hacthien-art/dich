@@ -104,3 +104,69 @@ export function setPath(obj, path, value) {
   }
   o[path[path.length - 1]] = value;
 }
+
+const DOT_SEG_DELIM = /[\s.,;:'"`()\[\]{}<>，。；：！？、]/;
+
+function readDotSegAfter(text, p, noNewline) {
+  const len = text.length;
+  if (p >= len) return -1;
+  if (text[p] === '$' && text[p + 1] === '{') {
+    const maxEnd = Math.min(len, p + 500);
+    let close = -1;
+    for (let i = p + 2; i < maxEnd; i++) {
+      const c = text[i];
+      if (c === '}') { close = i; break; }
+      if (noNewline && (c === '{' || c === '\n')) return -1;
+    }
+    return close >= 0 ? close + 1 : -1;
+  }
+  if (DOT_SEG_DELIM.test(text[p])) return -1;
+  let q = p + 1;
+  while (q < len && !DOT_SEG_DELIM.test(text[q])) q++;
+  return q;
+}
+
+function readDotSegBefore(text, dot, minPos, noNewline) {
+  if (dot <= minPos) return -1;
+  if (text[dot - 1] === '}') {
+    const floor = Math.max(minPos, dot - 500);
+    for (let i = dot - 2; i >= floor; i--) {
+      const c = text[i];
+      if (c === '}' || (noNewline && c === '\n')) return -1;
+      if (c === '{') {
+        return i > floor && text[i - 1] === '$' ? i - 1 : (i === minPos ? -1 : -1);
+      }
+    }
+    return -1;
+  }
+  if (DOT_SEG_DELIM.test(text[dot - 1])) return -1;
+  let p = dot - 1;
+  while (p > minPos && !DOT_SEG_DELIM.test(text[p - 1])) p--;
+  return p;
+}
+
+/**
+ * Quét tuyến tính O(N) tìm các chuỗi dạng a.b.c (có hỗ trợ đoạn ${...}).
+ * Tránh hoàn toàn lỗi backtracking O(N^2) của regex trên các chuỗi base64/CSS dài hàng MB.
+ */
+export function forEachDotChain(text, fn, { noNewline = false } = {}) {
+  if (!text) return;
+  let pos = 0;
+  const len = text.length;
+  while (pos < len) {
+    const dot = text.indexOf('.', pos);
+    if (dot < 0) break;
+    const firstAfter = readDotSegAfter(text, dot + 1, noNewline);
+    if (firstAfter < 0) { pos = dot + 1; continue; }
+    const segStart = readDotSegBefore(text, dot, pos, noNewline);
+    if (segStart < 0) { pos = dot + 1; continue; }
+    let end = firstAfter;
+    while (end < len && text[end] === '.') {
+      const nextEnd = readDotSegAfter(text, end + 1, noNewline);
+      if (nextEnd < 0) break;
+      end = nextEnd;
+    }
+    fn(text.slice(segStart, end), segStart, end);
+    pos = end;
+  }
+}

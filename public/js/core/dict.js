@@ -2,7 +2,7 @@
 // Mỗi mục: { src, kind: key|value|marker|term, dst, keep, manual, count, parents:Set, samples:[] }
 import { load as yamlLoad } from '../../vendor/js-yaml.mjs';
 import { lexJs, significant } from './lexer.js';
-import { hasCJK, HAN_CLASS } from './util.js';
+import { hasCJK, HAN_CLASS, forEachDotChain } from './util.js';
 import { isInitVarEntry } from './card.js';
 
 const KIND_RANK = { key: 4, value: 3, marker: 2, term: 1 };
@@ -150,14 +150,22 @@ class Scanner {
         parent = parent ? parent + '.' + s : s;
       }
     };
-    const re1 = /(?:stat_data|display_data|delta_data)((?:\.[^\s.,;:'"`()\[\]{}<>，。；：！？、+]+|\[\s*['"][^'"\]]+['"]\s*\])+)/g;
-    while ((m = re1.exec(text))) addPath(m[1]);
-    const re2 = /\b(?:getvar|setvar|addvar|incvar|decvar|getMvuVariable|setMvuVariable|_\.(?:set|get|has|unset|update)|_\.(?:insert|remove|add|assign|delete|move))\s*\(\s*(?:[\w.$]+\s*,\s*)?(['"`])([^'"`\n]+)\1/g;
-    while ((m = re2.exec(text))) addPath(m[2].replace(/^stat_data\./, ''));
-    const re3 = /\{\{\s*(?:getvar|setvar|addvar|incvar|decvar|get_message_variable|get_chat_variable|format_message_variable|format_chat_variable)\s*::\s*([^:}]+)/gi;
-    while ((m = re3.exec(text))) addPath(m[1].trim().replace(/^stat_data\./, ''));
-    const re4 = /["']?(?:path|from)["']?\s*:\s*["'](\/[^"'\n]+)["']/g;
-    while ((m = re4.exec(text))) addPath(m[1]);
+    if (text.includes('stat_data') || text.includes('display_data') || text.includes('delta_data')) {
+      const re1 = /(?:stat_data|display_data|delta_data)((?:\.[^\s.,;:'"`()\[\]{}<>，。；：！？、+]+|\[\s*['"][^'"\]]+['"]\s*\])+)/g;
+      while ((m = re1.exec(text))) addPath(m[1]);
+    }
+    if (text.includes('(')) {
+      const re2 = /\b(?:getvar|setvar|addvar|incvar|decvar|getMvuVariable|setMvuVariable|_\.(?:set|get|has|unset|update)|_\.(?:insert|remove|add|assign|delete|move))\s*\(\s*(?:[\w.$]+\s*,\s*)?(['"`])([^'"`\n]+)\1/g;
+      while ((m = re2.exec(text))) addPath(m[2].replace(/^stat_data\./, ''));
+    }
+    if (text.includes('{{')) {
+      const re3 = /\{\{\s*(?:getvar|setvar|addvar|incvar|decvar|get_message_variable|get_chat_variable|format_message_variable|format_chat_variable)\s*::\s*([^:}]+)/gi;
+      while ((m = re3.exec(text))) addPath(m[1].trim().replace(/^stat_data\./, ''));
+    }
+    if (text.includes('path') || text.includes('from')) {
+      const re4 = /["']?(?:path|from)["']?\s*:\s*["'](\/[^"'\n]+)["']/g;
+      while ((m = re4.exec(text))) addPath(m[1]);
+    }
   }
 
   /** ${角色名} / ${外貌|性格|背景}: chỗ giữ chỗ khóa trong quy tắc cập nhật MVU -> thêm từng khóa thay thế */
@@ -172,20 +180,18 @@ class Scanner {
 
   /** Đường dẫn trần có ${…} trong văn bản (vd "冒险者队伍.${外貌|性格|背景}:" trong [mvu_update]) */
   scanPlaceholders(text, label) {
-    if (!text || !text.includes('${') || !hasCJK(text)) return;
-    const re = /(?:\$\{[^{}\n]*\}|[^\s.,;:'"`()\[\]{}<>，。；：！？、]+)(?:\.(?:\$\{[^{}\n]*\}|[^\s.,;:'"`()\[\]{}<>，。；：！？、]+))+/g;
-    let m;
-    while ((m = re.exec(text))) {
-      if (!m[0].includes('${') || !hasCJK(m[0])) continue;
-      const segs = m[0].split(/\.(?![^{]*\})/);
+    if (!text || !text.includes('${') || !text.includes('.') || !hasCJK(text)) return;
+    forEachDotChain(text, (chain) => {
+      if (!chain.includes('${') || !hasCJK(chain)) return;
+      const segs = chain.split(/\.(?![^{]*\})/);
       // ít nhất một đoạn là khóa đã biết (tránh nhầm với mã JS)
-      if (!segs.some((s) => !s.startsWith('${') && this.map.get(s)?.kind === 'key')) continue;
+      if (!segs.some((s) => !s.startsWith('${') && this.map.get(s)?.kind === 'key')) return;
       let parent = '';
       for (const s of segs) {
         if (s.startsWith('${') && s.endsWith('}')) this.addPlaceholder(s, parent, label);
         parent = parent ? parent + '.' + s : s;
       }
-    }
+    }, { noNewline: true });
   }
 
   scanComparisons(text, label) {

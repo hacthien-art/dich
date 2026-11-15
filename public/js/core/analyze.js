@@ -3,7 +3,7 @@
 // Bản dịch lưu theo khóa = văn bản nguồn có placeholder ⟦n⟧ (bộ nhớ dịch / TM), nên đổi bảng biến
 // không cần dịch lại: chỉ cần render lại.
 import { lexJs, lexHtml, lexCss, significant, cssPropertyBefore } from './lexer.js';
-import { hasCJK, isIdentifier, escapeRegex, HAN_CLASS } from './util.js';
+import { hasCJK, isIdentifier, escapeRegex, HAN_CLASS, forEachDotChain } from './util.js';
 import { splitCompositeKnown } from './dict.js';
 
 export const PH_RE = /⟦\s*(\d+)\s*⟧/g;
@@ -20,6 +20,12 @@ const YAML_PLAIN_BAD = /^[-?:,[\]{}#&*!|>'"%@`]|:\s|\s#|^\s|\s$|^$/;
 
 /** Văn bản có vẻ là HTML (có thẻ chuẩn) */
 export function looksLikeHtml(s) { return HTML_HINT_RE.test(s); }
+
+const CSS_HINT_RE = /(?:@(?:font-face|keyframes|media|import|supports|charset|layer)\b|:root\s*\{|[.#a-zA-Z][\w\s.#*:>+~[\]="'()-]{0,120}\{\s*(?:--[\w-]+|[a-zA-Z-]{3,})\s*:)/;
+/** Văn bản có vẻ là bảng kiểu CSS (nhúng trong chuỗi JS) */
+export function looksLikeCss(s) {
+  return s.length > 24 && s.includes('{') && s.includes('}') && s.includes(':') && !/<[a-zA-Z\/!]/.test(s) && CSS_HINT_RE.test(s);
+}
 
 // ====================================================================== cấu trúc dữ liệu
 class Node {
@@ -172,9 +178,8 @@ class Analyzer {
     const given = (o.holes || []).filter((h) => h.start >= start && h.end <= end);
     // cắt khoảng trắng 2 đầu (không cắt vào hole)
     let s = start, e = end;
-    const inHole = (p) => given.some((h) => p >= h.start && p < h.end);
-    while (s < e && /\s/.test(src[s]) && !inHole(s)) s++;
-    while (e > s && /\s/.test(src[e - 1]) && !inHole(e - 1)) e--;
+    while (s < e && /\s/.test(src[s]) && !holeAt(given, s, false)) s++;
+    while (e > s && /\s/.test(src[e - 1]) && !holeAt(given, e - 1, false)) e--;
     if (s >= e) { this.flushHoles(parent, given); return; }
     const text = src.slice(s, e);
 
@@ -191,7 +196,7 @@ class Analyzer {
     const barriers = holes.filter((h) => isEjsScriptlet(src, h.start));
     if (barriers.length) {
       let pos = s;
-      const sub = (a, b) => { if (b > a) this.textRun(parent, a, b, { ...o, holes: given.filter((g) => g.start >= a && g.end <= b) }); };
+      const sub = (a, b) => { if (b > a) this.textRun(parent, a, b, { ...o, holes: sliceHoles(given, a, b) }); };
       for (const b of barriers) {
         sub(pos, b.start);
         this.flushHoles(parent, [b], esc);
@@ -200,32 +205,43 @@ class Analyzer {
       sub(pos, e);
       return;
     }
-    // phần chữ ngoài hole có CJK?
-    let outside = '', pos = s;
-    for (const h of holes) { outside += src.slice(pos, h.start); pos = h.end; }
-    outside += src.slice(pos, e);
-    if (!hasCJK(outside)) { this.flushHoles(parent, holes, esc); return; }
+    // phần chữ ngoài hole có CJK? (kiểm tra từng khoảng trống thay vì nối chuỗi lớn)
+    let outsideHasCJK = false, pos = s;
+    for (const h of holes) {
+      if (h.start > pos && hasCJK(src.slice(pos, h.start))) { outsideHasCJK = true; break; }
+      pos = h.end;
+    }
+    if (!outsideHasCJK && pos < e && hasCJK(src.slice(pos, e))) outsideHasCJK = true;
+    if (!outsideHasCJK) { this.flushHoles(parent, holes, esc); return; }
 
     // 3) chia nhỏ văn bản dài
     const limit = o.chunk === false ? Infinity : (this.opts.chunkSize || 1800);
     const pieces = e - s > limit ? splitRange(src, s, e, holes, limit) : [[s, e]];
+    let hi = 0;
     for (const [ps, pe0] of pieces) {
+      while (hi < holes.length && holes[hi].end <= ps) hi++;
+      let hj = hi;
+      while (hj < holes.length && holes[hj].start < pe0) hj++;
+      const pieceHoles = holes.slice(hi, hj);
       let a = ps, b = pe0;
-      while (a < b && /\s/.test(src[a]) && !holes.some((h) => a >= h.start && a < h.end)) a++;
-      while (b > a && /\s/.test(src[b - 1]) && !holes.some((h) => b - 1 >= h.start && b - 1 < h.end)) b--;
+      while (a < b && /\s/.test(src[a]) && !holeAt(pieceHoles, a, false)) a++;
+      while (b > a && /\s/.test(src[b - 1]) && !holeAt(pieceHoles, b - 1, false)) b--;
       if (a >= b) continue;
-      const hs = mergeAdjacent(src, holes.filter((h) => h.start >= a && h.end <= b));
-      let key = '', p = a;
+      const hs = mergeAdjacent(src, pieceHoles.filter((h) => h.start >= a && h.end <= b));
+      let key = '', p = a, segHasCJK = false;
       const segHoles = [];
       for (const h of hs) {
-        key += src.slice(p, h.start);
+        const gap = src.slice(p, h.start);
+        if (!segHasCJK && hasCJK(gap)) segHasCJK = true;
+        key += gap;
         segHoles.push(h.hole);
         key += ph(segHoles.length);
         p = h.end;
       }
-      key += src.slice(p, b);
-      const out2 = key.replace(PH_RE, '');
-      if (!hasCJK(out2)) { this.flushHoles(parent, hs, esc); continue; }
+      const tail = src.slice(p, b);
+      if (!segHasCJK && hasCJK(tail)) segHasCJK = true;
+      key += tail;
+      if (!segHasCJK) { this.flushHoles(parent, hs, esc); continue; }
       const seg = this.newSeg(key, segHoles, o.kind || 'prose', esc);
       parent.reps.push({ start: a, end: b, render: (env) => renderSegment(seg, env) });
     }
@@ -253,6 +269,13 @@ class Analyzer {
     const out = [];
     const add = (a, b, hole) => { out.push({ start: s + a, end: s + b, hole }); };
     let m;
+    // data URI dạng base64 dài (nhúng font/ảnh/âm thanh): giữ nguyên, không cắt nhỏ hay gửi AI
+    if (text.includes(';base64,')) {
+      const re = /data:[\w.+/-]+;base64,[A-Za-z0-9+/=\s]+/g;
+      while ((m = re.exec(text))) {
+        if (m[0].length >= 64) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
+      }
+    }
     // EJS <% ... %>
     if (text.includes('<%')) {
       const re = /<%[\s\S]*?%>/g;
@@ -320,15 +343,14 @@ class Analyzer {
       const re = /^([ \t]*)(@@[A-Za-z_][\w:-]*)/gm;
       while ((m = re.exec(text))) add(m.index + m[1].length, m.index + m[0].length, this.rawHole(s + m.index + m[1].length, s + m.index + m[0].length));
     }
-    // đường dẫn trần a.b.c (>=2 đoạn, toàn khóa đã biết)
+    // đường dẫn trần a.b.c (>=2 đoạn, toàn khóa đã biết) — quét tuyến tính O(N) tránh treo với base64/CSS dài
     if (text.includes('.')) {
-      const re = new RegExp('(?:\\$\\{[^}]*\\}|[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+)(?:\\.(?:\\$\\{[^}]*\\}|[^\\s.,;:\'"`()\\[\\]{}<>，。；：！？、]+))+', 'g');
-      while ((m = re.exec(text))) {
-        if (!hasCJK(m[0])) continue;
+      forEachDotChain(text, (chain, startIdx) => {
+        if (!hasCJK(chain)) return;
         // bỏ tiền tố không phải đường dẫn (vd "更新世界.时间" -> chỉ lấy phần khớp từ điển)
-        const r = this.trimPathMatch(m[0]);
-        if (r) add(m.index + r.offset, m.index + r.offset + r.text.length, this.pathHole(r.text));
-      }
+        const r = this.trimPathMatch(chain);
+        if (r) add(startIdx + r.offset, startIdx + r.offset + r.text.length, this.pathHole(r.text));
+      });
     }
     // dòng khóa YAML:  "  世界.时间:"  /  "  好感度:"
     if (o.yamlKeys) {
@@ -351,19 +373,20 @@ class Analyzer {
         add(a, a + m[3].length, this.dictHole(m[3], 'marker'));
       }
     }
-    // bỏ các vùng nằm trong hole đã có
-    return out.filter((h) => !given.some((g) => h.start < g.end && h.end > g.start));
+    // bỏ các vùng nằm trong hole đã có (dùng tìm kiếm nhị phân O(log G) thay vì O(G))
+    return given.length ? out.filter((h) => !overlapsAny(given, h.start, h.end)) : out;
   }
 
   trimPathMatch(text) {
     const parts = text.split('.');
-    // tìm dãy liên tiếp dài nhất toàn đoạn hợp lệ, cho phép đoạn đầu chỉ khớp ở phần đuôi
+    // tìm dãy liên tiếp dài nhất toàn đoạn hợp lệ, cho phép đoạn đầu chỉ khớp ở phần đuôi (tối đa 60 ký tự)
     let first = parts[0];
     let offset = 0;
     if (!this.isPathSeg(first)) {
       // thử cắt đầu: tìm hậu tố của đoạn đầu là khóa
       let found = null;
-      for (let i = 1; i < first.length; i++) {
+      const startIdx = Math.max(1, first.length - 60);
+      for (let i = startIdx; i < first.length; i++) {
         const suf = first.slice(i);
         if (this.isPathSeg(suf) === 'key' || this.isPathSeg(suf) === 'root') { found = i; break; }
       }
@@ -374,9 +397,9 @@ class Analyzer {
     const segs = [first];
     for (let i = 1; i < parts.length; i++) {
       if (this.isPathSeg(parts[i])) { segs.push(parts[i]); continue; }
-      // đoạn cuối dính chữ thường: "时间更新" -> lấy tiền tố "时间"
+      // đoạn cuối dính chữ thường: "时间更新" -> lấy tiền tố "时间" (tối đa 60 ký tự)
       const p = parts[i];
-      for (let j = p.length - 1; j > 0; j--) {
+      for (let j = Math.min(p.length - 1, 60); j > 0; j--) {
         if (this.isPathSeg(p.slice(0, j)) === 'key') { segs.push(p.slice(0, j)); break; }
       }
       break;
@@ -428,8 +451,8 @@ class Analyzer {
     }
     let lexSrc = src, base = 0, lexStart = start, lexEnd = end;
     if (masks.length) {
-      let local = src.slice(start, end);
-      for (const k of masks) local = local.slice(0, k.start - start) + '\u0001'.repeat(k.end - k.start) + local.slice(k.end - start);
+      masks.sort((a, b) => a.start - b.start);
+      const local = maskRanges(src.slice(start, end), masks.map((k) => ({ start: k.start - start, end: k.end - start })));
       lexSrc = local; base = start; lexStart = 0; lexEnd = local.length;
     }
     const toks = lexHtml(lexSrc, lexStart, lexEnd).map((t) => shiftTok(t, base));
@@ -735,11 +758,13 @@ class Analyzer {
     const policy = this.stringPolicy(mode, sig, i);
     // chuỗi giữ nguyên: vẫn đồng bộ nhãn 【…】, khóa trong nháy lồng, đường dẫn biến… (có escape đúng kiểu chuỗi)
     if ((policy === 'none' || (policy === 'smart' && this.keepJsString(sig, i, braceStack))) && !isDescribe) {
-      this.flushHoles(parent, this.findProtections(t.cStart, t.cEnd, { jsEscapes: true }, []), escFor);
+      this.flushHoles(parent, this.findProtections(t.cStart, t.cEnd, {}, []), escFor);
       return;
     }
     // chuỗi có HTML bên trong
     if (/<[a-zA-Z\/!]/.test(content)) { this.htmlRange(parent, t.cStart, t.cEnd, { esc, jsEscapes: true }); return; }
+    // chuỗi là bảng kiểu CSS (vd nhúng @font-face base64 + rule CSS trong script) -> chỉ dịch chuỗi content/comment CSS
+    if (looksLikeCss(content)) { this.cssRange(parent, t.cStart, t.cEnd, esc); return; }
     this.textRun(parent, t.cStart, t.cEnd, { esc, kind: isDescribe ? 'desc' : 'ui', jsEscapes: true });
   }
 
@@ -811,11 +836,13 @@ class Analyzer {
     if (policy === 'none') {
       for (const h of exprHoles) parent.reps.push(...h.node.reps);
       // phần tĩnh vẫn đồng bộ nhãn/khóa/đường dẫn
-      for (const p of t.parts) if (p.type === 'str' && hasCJK(src.slice(p.start, p.end))) this.flushHoles(parent, this.findProtections(p.start, p.end, { jsEscapes: true }, []), esc);
+      for (const p of t.parts) if (p.type === 'str' && hasCJK(src.slice(p.start, p.end))) this.flushHoles(parent, this.findProtections(p.start, p.end, {}, []), esc);
       return;
     }
     if (/<[a-zA-Z\/!]/.test(masked)) {
       this.htmlRange(parent, cStart, cEnd, { esc, jsEscapes: true, masks: exprHoles.map((h) => ({ start: h.start, end: h.end, hole: h.hole })) });
+    } else if (!exprHoles.length && looksLikeCss(masked)) {
+      this.cssRange(parent, cStart, cEnd, esc);
     } else {
       this.textRun(parent, cStart, cEnd, { holes: exprHoles.map((h) => ({ start: h.start, end: h.end, hole: h.hole })), esc, kind: 'ui', jsEscapes: true });
     }
@@ -1099,8 +1126,58 @@ function shiftTok(t, base) {
 }
 
 function maskRanges(text, ranges) {
-  let out = text;
-  for (const r of ranges) out = out.slice(0, r.start) + '\u0001'.repeat(Math.max(0, r.end - r.start)) + out.slice(r.end);
+  if (!ranges.length) return text;
+  const sorted = ranges.slice().sort((a, b) => a.start - b.start);
+  let out = '', pos = 0;
+  for (const r of sorted) {
+    const s = Math.max(pos, r.start), e = Math.max(s, Math.min(text.length, r.end));
+    if (s > pos) out += text.slice(pos, s);
+    if (e > s) out += '\u0001'.repeat(e - s);
+    pos = e;
+  }
+  if (pos < text.length) out += text.slice(pos);
+  return out;
+}
+
+/** Tìm hole chứa vị trí p trong mảng holes đã sắp xếp. strictInterior=true: h.start < p < h.end */
+function holeAt(holes, p, strictInterior = false) {
+  let lo = 0, hi = holes.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const h = holes[mid];
+    if (p < h.start || (strictInterior && p === h.start)) hi = mid - 1;
+    else if (p >= h.end) lo = mid + 1;
+    else return h;
+  }
+  return null;
+}
+
+/** Kiểm tra đoạn [start, end) có giao với bất kỳ hole nào trong mảng đã sắp xếp không */
+function overlapsAny(holes, start, end) {
+  let lo = 0, hi = holes.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const h = holes[mid];
+    if (h.end <= start) lo = mid + 1;
+    else if (h.start >= end) hi = mid - 1;
+    else return true;
+  }
+  return false;
+}
+
+/** Lấy các hole nằm gọn trong [start, end] từ mảng holes đã sắp xếp */
+function sliceHoles(holes, start, end) {
+  if (!holes.length) return [];
+  let lo = 0, hi = holes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (holes[mid].start < start) lo = mid + 1;
+    else hi = mid;
+  }
+  const out = [];
+  for (let i = lo; i < holes.length && holes[i].start < end; i++) {
+    if (holes[i].end <= end) out.push(holes[i]);
+  }
   return out;
 }
 
@@ -1152,7 +1229,7 @@ function yamlPlainKey(v) {
 
 /** Chia [s,e) thành các khúc <= limit tại ranh giới dòng, không cắt giữa hole */
 function splitRange(src, s, e, holes, limit) {
-  const inHole = (p) => holes.some((h) => p > h.start && p < h.end);
+  const inHole = (p) => !!holeAt(holes, p, true);
   const pieces = [];
   let a = s;
   while (e - a > limit) {
@@ -1166,7 +1243,12 @@ function splitRange(src, s, e, holes, limit) {
       if (best > a) { cut = best; break; }
     }
     if (cut < 0) cut = a + limit;
-    while (inHole(cut) && cut < e) cut++;
+    // nếu điểm cắt rơi vào giữa một hole (vd base64 / EJS / thẻ dài), nhảy thẳng qua cuối hole thay vì cộng từng ký tự
+    for (;;) {
+      const h = holeAt(holes, cut, true);
+      if (!h || cut >= e) break;
+      cut = Math.min(e, h.end);
+    }
     pieces.push([a, cut]);
     a = cut;
   }
