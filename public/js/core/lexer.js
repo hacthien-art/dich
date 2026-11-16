@@ -8,17 +8,22 @@ const WS_CODES = new Set([9, 10, 11, 12, 13, 32, 0xa0, 0xfeff, 0x2028, 0x2029, 0
 const ID_START = /[\p{ID_Start}$_\\]/u;
 const ID_PART = /[\p{ID_Continue}$‌‍\\]/u;
 
+/** Literal dữ liệu thuần từ cỡ này trở lên được lexer gói thành MỘT token 'data' (không tách từng token bên trong) */
+export const DATA_MIN = 20000;
+
 /**
  * Tách token JS trong đoạn [start, end) của src.
- * Token: { type: 'ws'|'comment'|'ident'|'num'|'str'|'tmpl'|'regex'|'punct', start, end, value?, quote?, parts? }
+ * Token: { type: 'ws'|'comment'|'ident'|'num'|'str'|'tmpl'|'regex'|'punct'|'data', start, end, value?, quote?, parts? }
  * tmpl.parts: [{ type:'str', start, end } | { type:'expr', start, end, tokens }]
+ * opts.data = true: object/array chỉ gồm hằng (JSON, bảng dữ liệu) dài ≥ DATA_MIN thành một token 'data' — tránh tạo
+ * hàng chục triệu token cho các khối dữ liệu nhúng cỡ chục MB (bản đồ, bảng tra…). Duyệt bên trong bằng walkData().
  */
-export function lexJs(src, start = 0, end = src.length) {
-  return lexJsCore(src, start, end, false).tokens;
+export function lexJs(src, start = 0, end = src.length, opts = null) {
+  return lexJsCore(src, start, end, false, !!opts?.data).tokens;
 }
 
 /** Lõi lexer. stopAtBrace=true: dừng ở dấu } không khớp (dùng cho ${...} trong template) */
-function lexJsCore(src, start, end, stopAtBrace) {
+function lexJsCore(src, start, end, stopAtBrace, dataTokens = false) {
   const tokens = [];
   let i = start;
   let lastSig = null;
@@ -27,7 +32,7 @@ function lexJsCore(src, start, end, stopAtBrace) {
 
   function regexAllowed() {
     if (!lastSig) return true;
-    if (lastSig.type === 'num' || lastSig.type === 'str' || lastSig.type === 'tmpl' || lastSig.type === 'regex') return false;
+    if (lastSig.type === 'num' || lastSig.type === 'str' || lastSig.type === 'tmpl' || lastSig.type === 'regex' || lastSig.type === 'data') return false;
     if (lastSig.type === 'ident') return REGEX_PREV_KEYWORDS.has(lastSig.value);
     if (lastSig.type === 'punct') return ![')', ']', '++', '--'].includes(lastSig.value);
     return true;
@@ -69,9 +74,17 @@ function lexJsCore(src, start, end, stopAtBrace) {
     }
     // template literal
     if (c === '`') {
-      const t = lexTemplate(src, i, end);
+      const t = lexTemplate(src, i, end, dataTokens);
       push(t);
       i = t.end; continue;
+    }
+    // khối dữ liệu thuần lớn: { … } / [ … ] ở vị trí biểu thức
+    if (dataTokens && (c === '{' || c === '[') && end - i >= DATA_MIN && regexAllowed()) {
+      const de = walkData(src, i, end, null);
+      if (de > 0 && de - i >= DATA_MIN) {
+        push({ type: 'data', start: i, end: de });
+        i = de; continue;
+      }
     }
     // số
     if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
@@ -142,7 +155,7 @@ function lexJsCore(src, start, end, stopAtBrace) {
   return { tokens, pos: end };
 }
 
-function lexTemplate(src, start, end) {
+function lexTemplate(src, start, end, dataTokens = false) {
   const parts = [];
   let i = start + 1;
   let segStart = i;
@@ -156,7 +169,7 @@ function lexTemplate(src, start, end) {
     if (c === '$' && src[i + 1] === '{') {
       parts.push({ type: 'str', start: segStart, end: i });
       const exprStart = i + 2;
-      const r = lexJsCore(src, exprStart, end, true);
+      const r = lexJsCore(src, exprStart, end, true, dataTokens);
       parts.push({ type: 'expr', start: exprStart, end: r.pos, tokens: r.tokens });
       i = r.pos + 1;
       segStart = i;
@@ -166,6 +179,136 @@ function lexTemplate(src, start, end) {
   }
   if (segStart <= end) parts.push({ type: 'str', start: segStart, end });
   return { type: 'tmpl', start, end, parts, unterminated: true };
+}
+
+// ============================================================== dữ liệu thuần (JSON / literal JS chỉ gồm hằng)
+/** Mã ký tự là chữ Hán / Kana / Hangul (cùng tập với hasCJK ở util.js) */
+function isHanCode(c) {
+  return c >= 0x3040 && ((c <= 0x30ff) || (c >= 0x3400 && c <= 0x4dbf) || (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xf900 && c <= 0xfaff));
+}
+const isWsCode = (c) => c === 32 || c === 10 || c === 13 || c === 9 || c === 0xa0 || c === 0xfeff || c === 0x2028 || c === 0x2029 || c === 0x3000 || c === 11 || c === 12;
+const isIdentCode = (c) => (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 36 || (c >= 0x80 && !isWsCode(c));
+const DATA_WORDS = new Set(['true', 'false', 'null', 'undefined', 'NaN', 'Infinity']);
+
+/**
+ * Duyệt một literal dữ liệu thuần bắt đầu tại src[start] ('{' hoặc '['): JSON, hoặc object/array JS chỉ gồm chuỗi, số,
+ * true/false/null, !0/!1, void 0, khóa trần / khóa trong nháy, dấu phẩy thừa, chú thích. KHÔNG tạo token.
+ * Trả về vị trí ngay sau dấu đóng; -1 nếu gặp thứ không phải dữ liệu (hàm, biến, phép toán, template có ${}…).
+ * visitor (có thể null — chỉ kiểm tra):
+ *   key(kS, kE, quote, han)                — khóa của object; quote = '' nếu là định danh trần
+ *   value(vS, vE, quote, han, keyS, keyE)  — giá trị chuỗi; keyS/keyE: khóa đang chứa nó (mảng thừa hưởng khóa của
+ *                                            thuộc tính chứa mảng; -1 nếu không có)
+ * kS/kE, vS/vE là phạm vi NỘI DUNG (không gồm dấu nháy); han = chuỗi có chữ Hán/Kana/Hangul.
+ */
+export function walkData(src, start, end, visitor) {
+  const isObj = [], keyS = [], keyE = [];
+  let sp = -1, i = start;
+  let state = 0; // 0 chờ giá trị · 1 chờ khóa · 2 sau giá trị · 3 chờ dấu ':'
+  for (;;) {
+    // khoảng trắng + chú thích
+    for (;;) {
+      if (i >= end) return -1;
+      const w = src.charCodeAt(i);
+      if (isWsCode(w)) { i++; continue; }
+      if (w === 47) {
+        const d = src.charCodeAt(i + 1);
+        if (d === 47) { const nl = src.indexOf('\n', i + 2); i = nl < 0 || nl >= end ? end : nl + 1; continue; }
+        if (d === 42) { const ce = src.indexOf('*/', i + 2); if (ce < 0 || ce + 2 > end) return -1; i = ce + 2; continue; }
+        return -1;
+      }
+      break;
+    }
+    const c = src.charCodeAt(i);
+    if (state === 2) {
+      if (c === 44) { i++; state = isObj[sp] ? 1 : 0; continue; }
+      if ((c === 125 && isObj[sp]) || (c === 93 && !isObj[sp])) { sp--; i++; if (sp < 0) return i; continue; }
+      return -1;
+    }
+    if (state === 3) {
+      if (c !== 58) return -1;
+      i++; state = 0; continue;
+    }
+    // chuỗi (giá trị hoặc khóa)
+    if (c === 34 || c === 39 || c === 96) {
+      let j = i + 1, han = false;
+      for (;;) {
+        if (j >= end) return -1;
+        const d = src.charCodeAt(j);
+        if (d === 92) { j += 2; continue; }
+        if (d === c) break;
+        if (d === 10 && c !== 96) return -1;
+        if (c === 96 && d === 36 && src.charCodeAt(j + 1) === 123) return -1; // `…${}…`
+        if (d >= 0x3040 && !han && isHanCode(d)) han = true;
+        j++;
+      }
+      if (state === 1) {
+        keyS[sp] = i + 1; keyE[sp] = j;
+        if (han && visitor) visitor.key(i + 1, j, src[i], true);
+        state = 3;
+      } else {
+        if (han && visitor) visitor.value(i + 1, j, src[i], true, sp >= 0 ? keyS[sp] : -1, sp >= 0 ? keyE[sp] : -1);
+        state = 2;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (state === 1) {
+      if (c === 125) { sp--; i++; if (sp < 0) return i; state = 2; continue; } // {} hoặc dấu phẩy thừa
+      if (!isIdentCode(c)) return -1;
+      let j = i + 1, han = c >= 0x3040 && isHanCode(c);
+      while (j < end) {
+        const d = src.charCodeAt(j);
+        if (!isIdentCode(d)) break;
+        if (d >= 0x3040 && !han && isHanCode(d)) han = true;
+        j++;
+      }
+      keyS[sp] = i; keyE[sp] = j;
+      if (han && visitor) visitor.key(i, j, '', true);
+      i = j; state = 3;
+      continue;
+    }
+    // state 0: giá trị
+    if (c === 123) { sp++; isObj[sp] = true; keyS[sp] = -1; keyE[sp] = -1; i++; state = 1; continue; }
+    if (c === 91) {
+      const ks = sp >= 0 ? keyS[sp] : -1, ke = sp >= 0 ? keyE[sp] : -1;
+      sp++; isObj[sp] = false; keyS[sp] = ks; keyE[sp] = ke; i++;
+      continue;
+    }
+    if (c === 93 && sp >= 0 && !isObj[sp]) { sp--; i++; if (sp < 0) return i; state = 2; continue; } // [] hoặc dấu phẩy thừa
+    if (c === 44 && sp >= 0 && !isObj[sp]) { i++; continue; } // ô trống trong mảng
+    if (sp < 0) return -1;
+    if ((c >= 48 && c <= 57) || c === 45 || c === 43 || c === 46) {
+      let j = i + 1;
+      while (j < end) {
+        const d = src.charCodeAt(j);
+        if ((d >= 48 && d <= 57) || d === 46 || d === 95 || (d >= 97 && d <= 102) || (d >= 65 && d <= 70) || d === 120 || d === 88 || d === 111 || d === 79 || d === 110) { j++; continue; }
+        if ((d === 43 || d === 45) && (src.charCodeAt(j - 1) | 32) === 101) { j++; continue; }
+        break;
+      }
+      if (j === i + 1 && (c === 45 || c === 43 || c === 46)) return -1;
+      i = j; state = 2;
+      continue;
+    }
+    if (c === 33) { // !0 / !1
+      const d = src.charCodeAt(i + 1);
+      if (d !== 48 && d !== 49) return -1;
+      i += 2; state = 2;
+      continue;
+    }
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) {
+      let j = i + 1;
+      while (j < end && isIdentCode(src.charCodeAt(j))) j++;
+      const word = src.slice(i, j);
+      if (word === 'void') {
+        while (j < end && isWsCode(src.charCodeAt(j))) j++;
+        if (src.charCodeAt(j) !== 48) return -1;
+        j++;
+      } else if (!DATA_WORDS.has(word)) return -1;
+      i = j; state = 2;
+      continue;
+    }
+    return -1;
+  }
 }
 
 /** Danh sách token có nghĩa (bỏ ws/comment) kèm chỉ số gốc */

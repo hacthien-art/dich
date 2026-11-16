@@ -2,12 +2,30 @@
 // Nguyên tắc: chỉ thay thế đúng vị trí — mã HTML/JS/CSS ngoài phần chữ được giữ nguyên từng ký tự.
 // Bản dịch lưu theo khóa = văn bản nguồn có placeholder ⟦n⟧ (bộ nhớ dịch / TM), nên đổi bảng biến
 // không cần dịch lại: chỉ cần render lại.
-import { lexJs, lexHtml, lexCss, significant, cssPropertyBefore } from './lexer.js';
+import { lexJs, lexHtml, lexCss, significant, cssPropertyBefore, walkData } from './lexer.js';
 import { hasCJK, isIdentifier, escapeRegex, HAN_CLASS, forEachDotChain } from './util.js';
 import { splitCompositeKnown } from './dict.js';
 
 export const PH_RE = /⟦\s*(\d+)\s*⟧/g;
 export const ph = (n) => `⟦${n}⟧`;
+
+// token của nội dung nhúng / link ngoài (xem embed.js): ⟪emb:id⟫ ⟪url:id⟫ — luôn giữ nguyên
+const EMBED_TOKEN_RE = /⟪(?:emb|url):[0-9a-z]+⟫/g;
+
+/** Chuỗi là URL / data URI — không bao giờ dịch (dịch là hỏng link) */
+export function isUrlLike(s) {
+  return /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s]+$/i.test(s) || /^(?:data|blob|mailto|javascript):/i.test(s) || /^⟪url:[0-9a-z]+⟫/.test(s);
+}
+
+const SLUG_STOP = /[\s·、，。：；！？（）《》「」『』【】…—]/;
+/**
+ * Chuỗi là mã định danh / tham chiếu / tên tệp lẫn chữ Hán: "pref-nanjing-松江府", "yuan-zhongshu-大都路-0", "明史/卷6",
+ * "research/明史-卷6.txt". Loại này được mã ghép, tra bảng, dựng link nên phải giữ NGUYÊN (không hiển thị cho người đọc).
+ */
+export function isSlugLike(s) {
+  if (s.length > 200 || SLUG_STOP.test(s) || !hasCJK(s)) return false;
+  return /^[A-Za-z0-9]+[-_/:.][^\s]+$/.test(s) || /^[^\s]+[-_/:.][A-Za-z0-9]+$/.test(s);
+}
 
 const INLINE_TAGS = new Set(['a', 'abbr', 'b', 'bdi', 'bdo', 'big', 'br', 'cite', 'code', 'data', 'del', 'dfn', 'em', 'font', 'i', 'ins', 'kbd', 'mark', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'small', 'span', 'strike', 'strong', 'sub', 'sup', 'time', 'tt', 'u', 'var', 'wbr', 'label', 'nobr']);
 const TRANSLATE_ATTRS = new Set(['title', 'alt', 'placeholder', 'aria-label', 'aria-placeholder', 'aria-description', 'aria-roledescription', 'label', 'data-tooltip', 'data-title', 'data-placeholder', 'data-tip', 'tooltip']);
@@ -42,7 +60,19 @@ class Node {
   constructor(start, end) { this.start = start; this.end = end; this.reps = []; }
 }
 function renderNode(src, node, env) {
-  const reps = node.reps.slice().sort((a, b) => a.start - b.start);
+  const reps = node.sorted ? node.reps : node.reps.slice().sort((a, b) => a.start - b.start);
+  if (reps.length > 20000) {
+    // rất nhiều mảnh: gom vào mảng rồi nối 1 lần (nối chuỗi dần tạo "rope" sâu, chậm khi làm phẳng)
+    const parts = [];
+    let pos = node.start;
+    for (const r of reps) {
+      if (r.start < pos) continue;
+      parts.push(src.slice(pos, r.start), r.render(env));
+      pos = r.end;
+    }
+    parts.push(src.slice(pos, node.end));
+    return parts.join('');
+  }
   let out = '', pos = node.start;
   for (const r of reps) {
     if (r.start < pos) continue; // chồng lấn (không nên xảy ra)
@@ -74,12 +104,22 @@ const yamlPlainEsc = (s) => (YAML_PLAIN_BAD.test(s) || /[\r\n]/.test(s) || /^(tr
 // tên / tiêu đề / dòng chú thích YAML: luôn 1 dòng
 const oneLine = (s) => s.replace(/\s*[\r\n]+\s*/g, ' ');
 const jsonEsc = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+// chuỗi nháy kép trong khối dữ liệu (JSON nghiêm ngặt): escape mọi ký tự điều khiển
+const JSON_CTRL = { '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f' };
+// eslint-disable-next-line no-control-regex
+const JSON_CTRL_RE = new RegExp('[\\\\"' + String.fromCharCode(0) + '-' + String.fromCharCode(0x1f, 0x2028, 0x2029) + ']', 'g');
+const jsonStrEsc = (s) => s.replace(JSON_CTRL_RE, (ch) => JSON_CTRL[ch] || '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
+// chuỗi đơn giản trong khối dữ liệu: không có gì cần bảo vệ (escape, thẻ, macro, nháy lồng, đường dẫn, nhãn, token…)
+const DATA_COMPLEX_RE = /[\\<{$&.@'"`「『“‘【[〖〔（(⟪]|_data|;base64,/;
+const SENTENCE_RE = /[\n，。！？；…]|[.!?;]\s/;
 // chú thích: bản dịch không được làm "thoát" khỏi chú thích
 const lineCommentEsc = (s) => s.replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');
 const blockCommentEsc = (s) => s.replace(/\*\//g, '* /');
 const htmlCommentEsc = (s) => s.replace(/--!?>/g, '- ->').replace(/<!--/g, '<!- -');
 // mã bên trong <% %> (EJS / ST-Prompt-Template): "%>" hay "<%" trong chuỗi/chú thích sẽ cắt ngang thẻ EJS
 // -> viết thành "%\>" / "<\%" (trong chuỗi JS vẫn ra đúng "%>" / "<%")
+const scriptEndEsc = (s) => (s.includes('</') ? s.replace(/<\/(script)/gi, '<\\/$1') : s);
+const styleEndEsc = (s) => (s.includes('</') ? s.replace(/<\/(style)/gi, '<\\/$1') : s);
 const ejsCodeEsc = (s) => s.replace(/%>/g, '%\\>').replace(/<%/g, '<\\%');
 const ejsTextEsc = (s) => s.replace(/%>/g, '% >').replace(/<%/g, '< %');
 /** Thẻ EJS điều khiển (<% if … { %>, <%_ … _%>) — không phải thẻ xuất giá trị (<%= / <%-) hay chú thích (<%#) */
@@ -106,6 +146,11 @@ class Analyzer {
     this.segments = [];
     this.warnings = [];
     this.markerRe = buildMarkerRe(this.dict.markers || []);
+    // lớp tài nguyên / nội dung nhúng: dịch NHẤT QUÁN mọi chuỗi (khóa dữ liệu ngoài từ điển cũng dịch qua bộ nhớ dịch),
+    // giữ nguyên mã định danh lẫn chữ Hán. Card thường: giữ hành vi cũ.
+    this.uniform = !!ctx.uniform;
+    this.keepFields = ctx.keepFields || null;
+    this.fields = new Map(); // tên trường dữ liệu -> { n, chars, distinct, sample, kept }
   }
 
   warn(msg) { if (!this.warnings.includes(msg)) this.warnings.push(msg); }
@@ -284,6 +329,11 @@ class Analyzer {
     const add = (a, b, hole) => { out.push({ start: s + a, end: s + b, hole }); };
     const refs = o.regexRefs || this.regexRefs;
     let m;
+    // token của nội dung nhúng / link ngoài: giữ nguyên từng ký tự
+    if (text.includes('⟪')) {
+      EMBED_TOKEN_RE.lastIndex = 0;
+      while ((m = EMBED_TOKEN_RE.exec(text))) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
+    }
     // data URI dạng base64 dài (nhúng font/ảnh/âm thanh): giữ nguyên, không cắt nhỏ hay gửi AI
     if (text.includes(';base64,')) {
       const re = /data:[\w.+/-]+;base64,[A-Za-z0-9+/=\s]+/g;
@@ -291,8 +341,8 @@ class Analyzer {
         if (m[0].length >= 64) add(m.index, m.index + m[0].length, this.rawHole(s + m.index, s + m.index + m[0].length));
       }
     }
-    // EJS <% ... %>
-    if (text.includes('<%')) {
+    // EJS <% ... %> (chỉ có trong nội dung card — tệp tài nguyên / lớp nhúng không qua ST-Prompt-Template)
+    if (!this.noEjs && text.includes('<%')) {
       const re = /<%[\s\S]*?%>/g;
       while ((m = re.exec(text))) {
         const node = this.ejsNode(s + m.index, s + m.index + m[0].length);
@@ -462,7 +512,7 @@ class Analyzer {
     const outerEsc = o.esc || identity;
     // che EJS và ${expr} để lexer HTML không bị nhiễu
     const masks = (o.masks || []).slice();
-    if (src.slice(start, end).includes('<%')) {
+    if (!this.noEjs && src.slice(start, end).includes('<%')) {
       let m;
       const local = src.slice(start, end);
       const re = /<%[\s\S]*?%>/g;
@@ -518,13 +568,19 @@ class Analyzer {
         if (t.tag === 'script') {
           const typeAttr = (t.attrs || []).find((a) => a.name.toLowerCase() === 'type');
           const typeVal = typeAttr && typeAttr.vStart >= 0 ? src.slice(typeAttr.vStart, typeAttr.vEnd).toLowerCase() : '';
-          if (!typeVal || /javascript|module|babel|jsx/.test(typeVal)) this.jsRange(parent, t.start, t.end, { mode: 'script', esc: outerEsc });
-          else if (/json/.test(typeVal)) this.jsRange(parent, t.start, t.end, { mode: 'json', esc: outerEsc });
+          // bản dịch chứa "</script" sẽ đóng thẻ sớm -> viết thành "<\/script" (trong chuỗi JS / JSON vẫn là "</script")
+          const sEsc = compose(scriptEndEsc, outerEsc);
+          if (!typeVal || /javascript|module|babel|jsx/.test(typeVal)) this.jsRange(parent, t.start, t.end, { mode: 'script', esc: sEsc });
+          else if (/json/.test(typeVal)) this.jsRange(parent, t.start, t.end, { mode: 'json', esc: sEsc });
           else if (/html|template/.test(typeVal)) this.htmlRange(parent, t.start, t.end, { ...o, masks: [] });
         } else if (t.tag === 'style') {
-          this.cssRange(parent, t.start, t.end, outerEsc);
+          this.cssRange(parent, t.start, t.end, compose(styleEndEsc, outerEsc));
         } else {
-          this.textRun(parent, t.start, t.end, { esc: outerEsc, htmlText: true, kind: 'ui', entities: true, regexRefs: o.regexRefs, jsEscapes: o.jsEscapes });
+          // <title>, <textarea>…: ${biểu thức} của template literal / thẻ EJS nằm bên trong phải là hole, nếu không
+          // chúng bị coi là chữ và bị escape thành "\${…}" (tooltip <title> của SVG hiện nguyên văn "${…}")
+          const inner = masks.filter((k) => k.start >= t.start && k.end <= t.end);
+          inner.forEach((k) => used.add(k));
+          this.textRun(parent, t.start, t.end, { holes: inner, esc: outerEsc, htmlText: true, kind: 'ui', entities: true, regexRefs: o.regexRefs, jsEscapes: o.jsEscapes });
         }
       } else if (t.type === 'comment' && this.opts.comments && hasCJK(src.slice(t.start, t.end))) {
         const ce = src.startsWith('-->', t.end - 3) && t.end - 3 >= t.start + 4 ? t.end - 3 : t.end;
@@ -576,6 +632,8 @@ class Analyzer {
         continue;
       }
       if (name === 'style') { if (hasCJK(raw)) this.cssRange(node, at.vStart, at.vEnd, esc); continue; }
+      // <iframe srcdoc="…"> chứa cả một trang HTML
+      if (name === 'srcdoc' && hasCJK(raw) && /<[a-zA-Z\/!]/.test(raw)) { this.htmlRange(node, at.vStart, at.vEnd, { esc, jsEscapes }); continue; }
       if (name === 'class' || name === 'id' || name === 'src' || name === 'href' || name === 'name' || name === 'for' || name === 'type' || name === 'rel' || name === 'lang' || name === 'xmlns') {
         this.flushHoles(node, inMask);
         continue;
@@ -628,14 +686,21 @@ class Analyzer {
   /** mode: script | attr | ejs | ejs-out | code | schema | json */
   jsRange(parent, start, end, o = {}) {
     const src = this.src;
-    const toks = o.tokens || lexJs(src, start, end);
+    const mode = o.mode || 'script';
+    // khối dữ liệu thuần lớn thành 1 token 'data' (trừ schema Zod và JSON của card: giữ cách phân tích cũ)
+    const useData = mode !== 'schema' && (mode !== 'json' || this.uniform);
+    const toks = o.tokens || lexJs(src, start, end, useData ? { data: true } : null);
     const sig = significant(toks);
     const outerEsc = o.esc || identity;
-    const mode = o.mode || 'script';
     const braceStack = []; // 'obj' | 'class' | false (khối lệnh)
     for (let i = 0; i < sig.length; i++) {
       const t = sig[i];
       const prev = sig[i - 1];
+      if (t.type === 'data') {
+        const policy = mode === 'json' ? 'smart' : this.stringPolicy(mode, sig, i);
+        this.dataRange(parent, t.start, t.end, { esc: outerEsc, translate: policy !== 'none' });
+        continue;
+      }
       if (t.type === 'punct') {
         if (t.value === '{' || t.value === '${') {
           let kind = false;
@@ -747,6 +812,8 @@ class Analyzer {
     const src = this.src;
     const content = src.slice(t.cStart, t.cEnd);
     if (!hasCJK(content)) return;
+    // URL có chữ Hán trong đường dẫn (…/dist/界面/index.html): dịch là hỏng link -> luôn giữ nguyên
+    if (isUrlLike(content)) return;
     const prev = sig[i - 1], next = sig[i + 1];
     const esc = compose(jsEsc(t.quote), outerEsc);
     const jsonMode = mode === 'json';
@@ -758,6 +825,8 @@ class Analyzer {
       if (rep) { parent.reps.push(rep); return; }
       if (this.pathInfo(content)) { const hole = this.pathHole(content); parent.reps.push({ start: t.cStart, end: t.cEnd, render: (env) => escFor(renderHole(hole, env)) }); return; }
     }
+    // lớp tài nguyên: mã định danh lẫn chữ Hán ("pref-nanjing-松江府", "明史/卷6") được mã ghép / tra bảng -> giữ nguyên
+    if (this.uniform && isSlugLike(content)) return;
     // .describe('...') trong schema -> mô tả cho AI, dịch
     const isDescribe = prev && prev.type === 'punct' && prev.value === '(' && sig[i - 2]?.type === 'ident' && /^(describe|meta|message|error|description)$/.test(sig[i - 2].value);
     if (mode === 'schema' && !isDescribe) {
@@ -798,12 +867,24 @@ class Analyzer {
     if (pv === '(' && sig[i - 2]?.type === 'ident' && (KEEP_ARG_FUNCS.has(sig[i - 2].value) || PATH_FUNCS.has(sig[i - 2].value))) return true;
     // chuỗi nằm trong lời gọi hàm API, kể cả khi được nối: getwi(null, sách + ' / 第' + n + '章'), querySelector('#a' + id)
     const call = enclosingCall(sig, i);
+    // el.setAttribute('aria-label', '收起摘要') / $(x).attr('title', '…'): đối số sau tên thuộc tính HIỂN THỊ là chữ cho
+    // người đọc -> dịch (trước đây bị giữ nguyên như mọi tham số của setAttribute)
+    if (call && ATTR_SETTERS.has(call) && this.labelAttrCall(sig, i)) return false;
     if (call && (KEEP_ARG_FUNCS.has(call) || (PATH_FUNCS.has(call) && call.length > 3))) return true;
     // import 'xxx'
     if (pv === 'import' || pv === 'from') return true;
     // includes / startsWith / indexOf / match / split / replace(第一参数)
     if (pv === '(' && sig[i - 2]?.type === 'ident' && /^(includes|startsWith|endsWith|indexOf|lastIndexOf|split|search|match|matchAll|replace|replaceAll|test|has|get|delete)$/.test(sig[i - 2].value)) return true;
     return false;
+  }
+
+  /** sig[i] nằm trong setAttribute('<thuộc tính hiển thị>', …) và không phải chính tên thuộc tính */
+  labelAttrCall(sig, i) {
+    const open = enclosingCallOpen(sig, i);
+    const first = open >= 0 ? sig[open + 1] : null;
+    if (!first || first.type !== 'str' || open + 1 === i) return false;
+    const name = this.src.slice(first.cStart, first.cEnd).toLowerCase();
+    return TRANSLATE_ATTRS.has(name) || /^aria-(?:label|description|placeholder|roledescription|valuetext)$/.test(name);
   }
 
   jsTemplate(parent, t, outerEsc, mode, sig, ti) {
@@ -859,6 +940,138 @@ class Analyzer {
       this.cssRange(parent, cStart, cEnd, esc);
     } else {
       this.textRun(parent, cStart, cEnd, { holes: exprHoles.map((h) => ({ start: h.start, end: h.end, hole: h.hole })), esc, kind: 'ui', jsEscapes: true });
+    }
+  }
+
+  // ====================================================================== khối dữ liệu thuần (token 'data')
+  /**
+   * JSON / literal chỉ gồm hằng, duyệt bằng walkData (không tạo token) — bảng dữ liệu nhúng cỡ lớn (bản đồ, bảng tra…).
+   * - khóa / giá trị có trong từ điển -> ánh xạ như mọi nơi khác trong card
+   * - URL, và (lớp tài nguyên) mã định danh lẫn chữ Hán -> giữ nguyên
+   * - giá trị còn lại -> đoạn dịch; mọi lần xuất hiện của cùng một chuỗi dùng chung MỘT đoạn (nên cùng một bản dịch)
+   * - khóa ngoài từ điển: card thường giữ nguyên (hành vi cũ); lớp tài nguyên dịch qua bộ nhớ dịch, cùng bản dịch với
+   *   giá trị trùng tên -> mã tra theo khóa vẫn khớp
+   * - trường (tên khóa chứa giá trị) nằm trong keepFields -> giữ nguyên mọi giá trị của trường đó
+   */
+  dataRange(parent, start, end, o = {}) {
+    const src = this.src;
+    const outerEsc = o.esc || identity;
+    const translate = o.translate !== false;
+    const plans = new Map(), escs = new Map();
+    const escOf = (q) => { let e = escs.get(q); if (!e) { e = compose(q === '"' ? jsonStrEsc : jsEsc(q), outerEsc); escs.set(q, e); } return e; };
+    const self = this;
+    walkData(src, start, end, {
+      key(kS, kE, quote) {
+        const name = src.slice(kS, kE);
+        const pk = 'k' + quote + name;
+        let plan = plans.get(pk);
+        if (plan === undefined) { plan = self.planDataKey(name, quote, quote ? escOf(quote) : outerEsc, translate); plans.set(pk, plan); }
+        self.applyDataPlan(parent, plan, kS, kE, quote ? escOf(quote) : outerEsc);
+      },
+      value(vS, vE, quote, han, keyS, keyE) {
+        const content = src.slice(vS, vE);
+        const pk = 'v' + quote + content;
+        let plan = plans.get(pk);
+        if (plan === undefined) { plan = self.planDataValue(content, escOf(quote), translate); plans.set(pk, plan); }
+        if (plan.count && self.noteField(keyS >= 0 ? src.slice(keyS, keyE) : '', content)) return; // trường được giữ nguyên
+        self.applyDataPlan(parent, plan, vS, vE, escOf(quote));
+      },
+    });
+  }
+
+  /** Thống kê theo tên trường dữ liệu (để người dùng chọn trường nào không dịch). Trả về true nếu trường đang bị giữ */
+  noteField(field, content) {
+    let f = this.fields.get(field);
+    if (!f) { f = { name: field, n: 0, chars: 0, distinct: 0, sample: content.slice(0, 80), kept: !!this.keepFields?.has(field), seen: new Set() }; this.fields.set(field, f); }
+    f.n++;
+    if (!f.seen.has(content)) { f.seen.add(content); f.distinct++; f.chars += content.length; }
+    return f.kept;
+  }
+
+  /** rep dùng chung cho mọi lần xuất hiện của cùng một chuỗi; kết quả được nhớ trong một lượt render */
+  sharedRender(compute) {
+    let lastEnv = null, lastVal = '';
+    return (env) => { if (env !== lastEnv) { lastVal = compute(env); lastEnv = env; } return lastVal; };
+  }
+
+  dictPlan(content, esc) {
+    const k = this.exactKind(content);
+    let hole = null;
+    if (k) hole = k === 'entry' ? { type: 'entry', src: content, esc: true } : k === 'book' ? { type: 'book', src: content, esc: true } : this.dictHole(content, k);
+    else hole = this.compositeHole(content) || (this.pathInfo(content) ? this.pathHole(content) : null);
+    return hole ? { t: 'rep', render: this.sharedRender((env) => esc(renderHole(hole, env))) } : null;
+  }
+
+  planDataValue(content, esc, translate) {
+    const plain = !content.includes('\\');
+    if (plain) { const d = this.dictPlan(content, esc); if (d) return d; }
+    if (!translate) return { t: 'sync' };
+    if (isUrlLike(content) || (this.uniform && isSlugLike(content))) return { t: 'skip' };
+    const kind = content.length <= 24 && !SENTENCE_RE.test(content) ? 'name' : 'prose';
+    if (/<[a-zA-Z\/!]/.test(content)) return { t: 'html', count: true };
+    if (looksLikeCss(content)) return { t: 'css' };
+    if (this.uniform && plain) { const list = this.listPlan(content, esc); if (list) return list; }
+    if (DATA_COMPLEX_RE.test(content) || content.length > (this.opts.chunkSize || 1800)) return { t: 'text', count: true, kind };
+    // chuỗi đơn giản: cắt khoảng trắng 2 đầu như textRun, một đoạn dịch cho mọi lần xuất hiện
+    const lead = content.length - content.trimStart().length, trail = content.length - content.trimEnd().length;
+    const key = content.slice(lead, content.length - trail);
+    if (!hasCJK(key)) return { t: 'skip' };
+    const seg = this.newSeg(key, [], kind, esc);
+    return { t: 'rep', count: true, lead, trail, render: this.sharedRender((env) => renderSegment(seg, env)) };
+  }
+
+  /**
+   * Chuỗi gói cả một DANH SÁCH tên ngắn ("出羽国 后醍醐朝廷 建武政权 …", "甲|乙|丙", "甲、乙、丙、丁"): dịch từng tên
+   * như một đoạn riêng rồi ghép lại bằng đúng dấu phân cách cũ. Mỗi tên chỉ dịch MỘT lần dù lặp lại ở hàng trăm danh
+   * sách, và cùng bản dịch với nơi tên đó đứng riêng (mã tìm tên trong danh sách vẫn khớp).
+   */
+  listPlan(content, esc) {
+    const parts = splitNameList(content);
+    if (!parts) return null;
+    const atoms = this.atomPlans || (this.atomPlans = new Map());
+    const items = parts.map((p) => {
+      if (!p.text || !hasCJK(p.text)) return p.text + p.sep;
+      let a = atoms.get(p.text);
+      if (a === undefined) {
+        const k = this.exactKind(p.text);
+        if (k) {
+          const hole = k === 'entry' ? { type: 'entry', src: p.text, esc: true } : k === 'book' ? { type: 'book', src: p.text, esc: true } : this.dictHole(p.text, k);
+          a = this.sharedRender((env) => renderHole(hole, env));
+        } else if (isUrlLike(p.text) || isSlugLike(p.text)) a = null;
+        else { const seg = this.newSeg(p.text, [], 'name', identity); a = this.sharedRender((env) => renderSegment(seg, env)); }
+        atoms.set(p.text, a);
+      }
+      return a ? { render: a, sep: p.sep } : p.text + p.sep;
+    });
+    return { t: 'rep', count: true, render: this.sharedRender((env) => esc(items.map((x) => (typeof x === 'string' ? x : x.render(env) + x.sep)).join(''))) };
+  }
+
+  planDataKey(name, quote, esc, translate) {
+    const quoteFor = (dst) => { const d = oneLine(dst); return d.includes("'") ? JSON.stringify(d) : "'" + d.replace(/\\/g, '\\\\') + "'"; };
+    if (!quote) { // khóa là định danh trần: { 战争: … }
+      const k = this.dict.kindOf(name);
+      if (k === 'key' || k === 'value' || k === 'term') return { t: 'rep', render: this.sharedRender((env) => { const dst = lookupDict(env, name); return isIdentifier(dst) ? dst : esc(quoteFor(dst)); }) };
+      if (!this.uniform || !translate || isSlugLike(name)) return { t: 'skip' };
+      const seg = this.newSeg(name, [], 'name', identity);
+      return { t: 'rep', render: this.sharedRender((env) => { if (!env.tm || env.tm.get(seg.key) == null) return name; const v = renderSegment(seg, env); return isIdentifier(v) ? v : esc(quoteFor(v)); }) };
+    }
+    const plain = !name.includes('\\');
+    if (plain) { const d = this.dictPlan(name, esc); if (d) return d; }
+    // khóa ngoài từ điển: card thường giữ nguyên; lớp tài nguyên dịch nhất quán với giá trị trùng tên
+    if (!this.uniform || !translate || !plain || isUrlLike(name) || isSlugLike(name)) return { t: 'skip' };
+    if (DATA_COMPLEX_RE.test(name) || name !== name.trim() || name.length > 80) return { t: 'skip' };
+    const seg = this.newSeg(name, [], 'name', (s) => esc(oneLine(s)));
+    return { t: 'rep', render: this.sharedRender((env) => renderSegment(seg, env)) };
+  }
+
+  applyDataPlan(parent, plan, s, e, esc) {
+    switch (plan.t) {
+      case 'rep': parent.reps.push({ start: s + (plan.lead || 0), end: e - (plan.trail || 0), render: plan.render }); break;
+      case 'text': this.textRun(parent, s, e, { esc, kind: plan.kind || 'prose', jsEscapes: true }); break;
+      case 'html': this.htmlRange(parent, s, e, { esc, jsEscapes: true }); break;
+      case 'css': this.cssRange(parent, s, e, esc); break;
+      case 'sync': this.flushHoles(parent, this.findProtections(s, e, {}, []), esc); break;
+      default: break;
     }
   }
 
@@ -1134,6 +1347,32 @@ class Analyzer {
   }
 }
 
+const LIST_STOP = /[，。！？；：,;!?]/; // có dấu câu -> là câu văn, không phải danh sách tên
+const LIST_SEPS = [/[ \t]+/g, /\s*\|\s*/g, /、/g, /\r?\n/g];
+/** Tách chuỗi là danh sách ≥ 4 tên ngắn ngăn bằng khoảng trắng, "|", "、" hoặc xuống dòng: [{ text, sep }] — không phải thì null */
+function splitNameList(s) {
+  if (s.length < 40) return null;
+  for (const re of LIST_SEPS) {
+    const out = [];
+    let pos = 0, m;
+    re.lastIndex = 0;
+    while ((m = re.exec(s))) {
+      if (!m[0]) { re.lastIndex++; continue; }
+      out.push({ text: s.slice(pos, m.index), sep: m[0] });
+      pos = m.index + m[0].length;
+    }
+    if (out.length < 3) continue;
+    out.push({ text: s.slice(pos), sep: '' });
+    let ok = true, han = 0;
+    for (const p of out) {
+      if (p.text.length > 24 || LIST_STOP.test(p.text)) { ok = false; break; }
+      if (hasCJK(p.text)) han++;
+    }
+    if (ok && han >= out.length * 0.6) return out;
+  }
+  return null;
+}
+
 /** Dấu { tại sig[i] mở thân class: class X {, class X extends Y {, (class {) */
 function isClassHead(sig, i) {
   for (let j = i - 1; j >= Math.max(0, i - 16); j--) {
@@ -1149,18 +1388,25 @@ function isClassHead(sig, i) {
 
 /** Tên hàm của lời gọi gần nhất bao quanh token sig[i] (vd print('…' + x) -> 'print') */
 function enclosingCall(sig, i) {
+  const j = enclosingCallOpen(sig, i);
+  return j >= 0 ? sig[j - 1].value : null;
+}
+
+/** Vị trí dấu "(" của lời gọi hàm gần nhất bao quanh sig[i]; -1 nếu không nằm trong lời gọi tên(…) */
+function enclosingCallOpen(sig, i) {
   let depth = 0;
   for (let j = i - 1; j >= 0 && j >= i - 200; j--) {
     const s = sig[j];
     if (s.type !== 'punct') continue;
     if (s.value === ')' || s.value === ']') depth++;
     else if (s.value === '(' || s.value === '[') {
-      if (depth === 0) return s.value === '(' && sig[j - 1]?.type === 'ident' ? sig[j - 1].value : null;
+      if (depth === 0) return s.value === '(' && sig[j - 1]?.type === 'ident' ? j : -1;
       depth--;
-    } else if (depth === 0 && (s.value === ';' || s.value === '{' || s.value === '}')) return null;
+    } else if (depth === 0 && (s.value === ';' || s.value === '{' || s.value === '}')) return -1;
   }
-  return null;
+  return -1;
 }
+const ATTR_SETTERS = new Set(['setAttribute', 'attr', 'prop']);
 
 /** Nội dung tĩnh của token chuỗi / template literal */
 function stringContent(src, t) {
@@ -1182,7 +1428,8 @@ function proseLike(s) {
 function rawIsProse(src, a, b, tag) {
   if (b <= a || !hasCJK(src.slice(a, b))) return false;
   const PUNCT = /[，。！？；：、]/;
-  if (tag === 'script') return lexJs(src, a, b).some((t) => t.type === 'punct' && PUNCT.test(t.value));
+  // data: true -> khối dữ liệu lớn trong script không bị tách thành hàng triệu token chỉ để kiểm tra
+  if (tag === 'script') return lexJs(src, a, b, { data: true }).some((t) => t.type === 'punct' && PUNCT.test(t.value));
   return lexCss(src, a, b).some((t) => t.type === 'other' && PUNCT.test(src.slice(t.start, t.end)));
 }
 
@@ -1422,11 +1669,27 @@ export function analyzeItem(item, ctx) {
   if (kind === 'keys' || kind === 'list') return analyzeList(item, ctx);
   if (kind === 'trimList') return analyzeTrimList(item, ctx);
   const src = String(item.text ?? '');
-  const an = new Analyzer(src, ctx);
+  // lớp tài nguyên / nội dung nhúng (base64, gzip, tệp đi kèm, link ngoài): dịch nhất quán, không có EJS
+  const layer = !!item.meta?.layer;
+  const an = new Analyzer(src, layer ? { ...ctx, uniform: true, keepFields: item.meta.keepFields || null } : ctx);
+  an.noEjs = layer;
   const root = new Node(0, src.length);
   const isReplace = !!item.meta?.isReplace;
   an.regexRefs = isReplace;
   switch (kind) {
+    case 'html': an.htmlRange(root, 0, src.length, {}); break;
+    case 'js': an.jsRange(root, 0, src.length, { mode: 'code' }); break;
+    case 'css': an.cssRange(root, 0, src.length); break;
+    case 'text': an.proseRange(root, 0, src.length, {}); break;
+    case 'data': {
+      // JSON thuần: duyệt thẳng bằng walkData; không phải dữ liệu thuần thì phân tích như JSON thường
+      let a = 0, b = src.length;
+      while (a < b && (/\s/.test(src[a]) || src.charCodeAt(a) === 0xfeff)) a++;
+      while (b > a && /\s/.test(src[b - 1])) b--;
+      if ((src[a] === '{' || src[a] === '[') && walkData(src, a, b, null) === b) an.dataRange(root, a, b, {});
+      else an.jsRange(root, 0, src.length, { mode: 'json' });
+      break;
+    }
     case 'name': an.textRun(root, 0, src.length, { kind: 'name', chunk: false, exact: false, esc: src.includes('\n') ? identity : oneLine }); break;
     case 'comment': an.commentRange(root, 0, src.length); break;
     case 'regexFind': an.regexFind(root, 0, src.length); break;
@@ -1439,12 +1702,25 @@ export function analyzeItem(item, ctx) {
     case 'button': { const rep = an.exactRep(0, src.length, src, identity); if (rep) root.reps.push(rep); break; }
     default: an.proseRange(root, 0, src.length, { regexRefs: isReplace }); break;
   }
-  const markerRe = kind === 'regexFind' || kind === 'regexTrim' || kind === 'button' ? null : an.markerRe;
+  // quét nhãn lần cuối: bỏ qua với lớp rất lớn (regex toàn văn trên hàng chục MB mỗi lần render)
+  const markerRe = kind === 'regexFind' || kind === 'regexTrim' || kind === 'button' || src.length > 4e6 ? null : an.markerRe;
+  // các rep của khối dữ liệu được thêm theo thứ tự tăng dần -> sắp xếp 1 lần ở đây, renderNode khỏi sắp lại mỗi lượt
+  if (root.reps.length > 5000) { root.reps.sort((a, b) => a.start - b.start); root.sorted = true; }
+  const fields = an.fields.size ? [...an.fields.values()].map(({ seen, ...f }) => f) : null;
   return {
-    segments: an.segments,
+    segments: dedupeSegments(an.segments),
     warnings: an.warnings,
+    fields,
     render(env) { return sweepMarkers(renderNode(src, root, { ...env, src }), markerRe, env); },
   };
+}
+
+/** Lớp dữ liệu lớn sinh rất nhiều đoạn trùng khóa (cùng một chuỗi lặp lại) — chỉ giữ mỗi khóa một đoạn */
+function dedupeSegments(segs) {
+  if (segs.length < 2000) return segs;
+  const seen = new Set(), out = [];
+  for (const s of segs) { if (seen.has(s.key)) continue; seen.add(s.key); out.push(s); }
+  return out;
 }
 
 /**

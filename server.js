@@ -8,6 +8,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 import { exec, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -262,6 +264,57 @@ async function handleBlob(req, res, parts) {
     return send(res, 200, { ok: true });
   }
   send(res, 405, { error: 'method' });
+}
+
+// ---------------------------------------------------------------- tải link ngoài của card (mã / dữ liệu trên GitHub, jsDelivr…)
+// Trình duyệt không tải thẳng được vì CORS, nên máy chủ cục bộ tải hộ. URL lấy từ nội dung card (không tin cậy), vì vậy:
+// chỉ http/https, chặn địa chỉ nội bộ (card không được mượn app để đọc dịch vụ trong mạng riêng của máy), giới hạn dung lượng.
+const FETCH_MAX = 128 * 1024 * 1024;
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  }
+  const v = ip.toLowerCase();
+  if (v.startsWith('::ffff:')) return isPrivateIp(v.slice(7));
+  return v === '::' || v === '::1' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb');
+}
+async function assertPublicHost(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '');
+  if (/^localhost$|\.localhost$|\.local$|\.internal$/i.test(host)) throw new Error('Không tải từ địa chỉ nội bộ: ' + host);
+  const addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
+  if (!addrs.length) throw new Error('Không phân giải được tên miền: ' + host);
+  for (const a of addrs) if (isPrivateIp(a.address)) throw new Error('Không tải từ địa chỉ nội bộ: ' + host);
+}
+async function handleFetch(req, res) {
+  const { url } = await readJson(req);
+  let cur = String(url || '').trim();
+  try {
+    for (let hop = 0; hop < 6; hop++) {
+      let u;
+      try { u = new URL(cur); } catch { return send(res, 400, { error: 'URL không hợp lệ' }); }
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return send(res, 400, { error: 'Chỉ tải được link http / https' });
+      await assertPublicHost(u.hostname);
+      const r = await fetch(u, { redirect: 'manual', headers: { 'User-Agent': 'TavernCardTranslator/1.3', Accept: '*/*' }, signal: AbortSignal.timeout(90000) });
+      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { cur = new URL(r.headers.get('location'), u).href; continue; }
+      if (!r.ok) return send(res, 502, { error: `Máy chủ của link trả lỗi HTTP ${r.status}` });
+      if (Number(r.headers.get('content-length') || 0) > FETCH_MAX) return send(res, 413, { error: 'Tệp quá lớn (trên 128 MB)' });
+      const chunks = [];
+      let size = 0;
+      const reader = r.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > FETCH_MAX) { reader.cancel().catch(() => {}); return send(res, 413, { error: 'Tệp quá lớn (trên 128 MB)' }); }
+        chunks.push(Buffer.from(value));
+      }
+      return send(res, 200, Buffer.concat(chunks), { 'X-Final-Url': encodeURIComponent(cur), 'X-Content-Type': encodeURIComponent(r.headers.get('content-type') || '') });
+    }
+    return send(res, 502, { error: 'Link chuyển hướng quá nhiều lần' });
+  } catch (e) {
+    return send(res, 502, { error: 'Không tải được link: ' + (e?.cause?.message || e.message || e) });
+  }
 }
 
 // ---------------------------------------------------------------- iframe xem trước (origin riêng)
@@ -549,6 +602,7 @@ const server = http.createServer(async (req, res) => {
       if (p.startsWith('/api/store/')) return await handleStore(req, res, p.slice('/api/store/'.length).split('/').filter(Boolean));
       if (p.startsWith('/api/blob/')) return await handleBlob(req, res, p.slice('/api/blob/'.length).split('/').filter(Boolean));
       if (p === '/api/frame' && req.method === 'POST') return await handleFramePost(req, res);
+      if (p === '/api/fetch' && req.method === 'POST') return await handleFetch(req, res);
       return send(res, 404, { error: 'API không tồn tại' });
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'method');

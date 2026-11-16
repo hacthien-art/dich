@@ -45,6 +45,7 @@
     <button class="tab active" data-tab="connect"><span>🔌</span>Kết nối API</button>
     <button class="tab" data-tab="preset"><span>🎛️</span>Preset &amp; Tham số</button>
     <button class="tab" data-tab="card"><span>📇</span>Card &amp; Bản dịch</button>
+    <button class="tab" data-tab="resources"><span>📦</span>Tài nguyên &amp; Link</button>
     <button class="tab" data-tab="vars"><span>🧬</span>Biến &amp; Đồng bộ</button>
     <button class="tab" data-tab="preview"><span>🧩</span>Regex &amp; Xem trước</button>
     <button class="tab" data-tab="check"><span>🩺</span>Kiểm tra <em id="checkBadge" class="badge" hidden>0</em></button>
@@ -57,6 +58,7 @@
     <section class="panel active" id="tab-connect"></section>
     <section class="panel" id="tab-preset"></section>
     <section class="panel" id="tab-card"></section>
+    <section class="panel" id="tab-resources"></section>
     <section class="panel" id="tab-vars"></section>
     <section class="panel" id="tab-preview"></section>
     <section class="panel" id="tab-check"></section>
@@ -67,7 +69,7 @@
   <input type="file" id="fileCard" accept=".png,.json,image/png,application/json" hidden>
   <div id="toasts"></div>
   <div id="modalRoot"></div>
-  <div id="dropOverlay" hidden><div>Thả file card (.png / .json) hoặc preset (.json) vào đây</div></div>
+  <div id="dropOverlay" hidden><div>Thả file card (.png / .json), preset (.json) hoặc tệp tài nguyên đi kèm (.gz / .html / .js) vào đây</div></div>
 
   <script type="module" src="/js/app.js"></script>
 </body>

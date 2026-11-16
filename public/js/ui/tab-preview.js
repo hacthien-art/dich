@@ -27,6 +27,7 @@ export function create(app, el) {
   const cols = {};
   let frameSeq = 0;
   let inputs = {};
+  let packing = -1; // phiên bản dự án đang được pack() (tránh gọi lặp)
 
   window.addEventListener('message', onFrameMessage);
 
@@ -105,6 +106,15 @@ export function create(app, el) {
     const p = app.project;
     if (!p) { el.classList.remove('fill'); el.append(h('h2', null, '🧩 Regex & Xem trước'), h('div', { class: 'empty' }, 'Hãy nhập card trước.')); return; }
     el.classList.add('fill');
+    // lớp nhúng (base64 / gzip) và link ngoài đã dịch phải được mã hóa lại (bất đồng bộ) rồi mới ghép được vào card
+    // xem trước; trong lúc chờ, bản xem trước dùng payload gốc
+    if (p.needsPack() && p.packedVersion !== p.version && packing !== p.version) {
+      packing = p.version;
+      p.pack(app.ts())
+        .then(() => { p._pvCard = null; if (app.currentTab === 'preview' && app.project === p) render(); })
+        .catch((e) => console.error('pack', e))
+        .finally(() => { packing = -1; });
+    }
     ensureChat();
     const side = h('div', { class: 'pv-side' });
     const main = h('div', { class: 'pv-main' });

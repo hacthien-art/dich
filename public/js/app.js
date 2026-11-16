@@ -4,11 +4,14 @@ import { store, safeId } from './ui/store.js';
 import { parseCardFile } from './core/card.js';
 import { DEFAULT_PRESET, importPreset } from './core/preset.js';
 import { runTranslation, suggestDict, resolveConflicts } from './core/translate.js';
-import { Project, DEFAULT_TRANSLATE_SETTINGS } from './project.js';
-import { uuid, debounce, deepClone, hasCJK } from './core/util.js';
+import { Project, DEFAULT_TRANSLATE_SETTINGS, unpackCardItems } from './project.js';
+import { uuid, debounce, deepClone, hasCJK, formatBytes } from './core/util.js';
+import { looksLikeResourceName } from './core/resource.js';
+import { mirrorUrls } from './core/links.js';
 import * as TabConnect from './ui/tab-connect.js';
 import * as TabPreset from './ui/tab-preset.js';
 import * as TabCard from './ui/tab-card.js';
+import * as TabResources from './ui/tab-resources.js';
 import * as TabVars from './ui/tab-vars.js';
 import * as TabPreview from './ui/tab-preview.js';
 import * as TabSettings from './ui/tab-settings.js';
@@ -81,7 +84,7 @@ async function boot() {
 
   await loadPresets();
 
-  const tabDefs = { connect: TabConnect, preset: TabPreset, card: TabCard, vars: TabVars, preview: TabPreview, check: TabCheck, settings: TabSettings, log: TabLog };
+  const tabDefs = { connect: TabConnect, preset: TabPreset, card: TabCard, resources: TabResources, vars: TabVars, preview: TabPreview, check: TabCheck, settings: TabSettings, log: TabLog };
   for (const [name, mod] of Object.entries(tabDefs)) {
     const el = document.getElementById('tab-' + name);
     app.tabs[name] = mod.create(app, el);
@@ -163,6 +166,12 @@ function bindChrome() {
 // ====================================================================== nhập file
 export async function importFile(file) {
   try {
+    // tệp tài nguyên đi kèm (gói bản đồ .gz, trang .html, tệp .js…) -> thêm vào dự án đang mở
+    if (looksLikeResourceName(file.name)) {
+      if (!app.project) return toast('Đây là tệp tài nguyên đi kèm card — hãy nhập card trước, rồi thả tệp này vào (hoặc dùng tab 📦 Tài nguyên).', 'warn', 8000);
+      await addResourceFile(file);
+      return;
+    }
     const bytes = await readFileBytes(file);
     const isJson = /\.json$/i.test(file.name) || bytes[0] === 0x7b;
     if (isJson) {
@@ -191,14 +200,22 @@ export async function importFile(file) {
     }
     if (app.project?.dirty) await saveProjectNow();
     const p = Project.fromFile(card, file.name);
+    await p.prepare(null); // bóc nội dung nhúng (base64 / gzip…) trong card
     p.rescan(app.ts());
     app.project = p;
     app.settings.lastProject = p.id;
     app.saveSettings();
     await saveProjectNow();
     const st = p.stats();
+    const nEmb = p.items.filter((it) => it.group === 'embedded').length;
+    const nLinks = p.links().filter((l) => l.klass === 'code').length;
     toast(`Đã nhập card "${p.cardName}": ${p.items.length} mục, ${st.total} đoạn cần dịch, ${Object.keys(p.data.dict).length} mục từ điển`, 'ok', 6000);
     app.log(`Nhập card ${file.name} (${card.spec.toUpperCase()}, ${card.format.toUpperCase()})`, 'ok');
+    if (nEmb) app.log(`Card có ${nEmb} lớp nội dung nhúng (base64 / nén) — đã bóc ra để dịch, khi xuất sẽ tự mã hóa lại`, 'info');
+    if (nLinks) {
+      app.log(`Card nạp ${nLinks} link ngoài tới mã / dữ liệu riêng (GitHub, jsDelivr…) — tải về để dịch ở tab 📦 Tài nguyên`, 'info');
+      toast(`Card này nạp ${nLinks} link ngoài (mã / giao diện đặt trên GitHub…). Mở tab 📦 Tài nguyên để tải về và dịch.`, 'info', 9000);
+    }
     app.refreshAll();
     showTab('card');
   } catch (e) {
@@ -242,6 +259,7 @@ app.updateCardDialog = updateCardDialog;
 async function applyCardUpdate(card) {
   const p = app.project;
   const ts = app.ts();
+  card.embeds = await unpackCardItems(card); // nội dung nhúng của bản card mới
   const { stats, undo } = p.updateCard(card, ts);
   await saveProjectNow();
   app.refreshAll();
@@ -317,12 +335,129 @@ async function saveProjectNow() {
 }
 app.saveProjectNow = saveProjectNow;
 
+// ====================================================================== tài nguyên đi kèm · link ngoài
+const appToken = () => document.querySelector('meta[name="app-token"]')?.content || '';
+const blobUrl = (projectId, resId) => '/api/blob/resources/' + encodeURIComponent(`${projectId}.${resId}`);
+
+/** Dữ liệu tệp tài nguyên lưu riêng (data/resources/…) — không nằm trong file dự án vì có thể tới hàng chục MB */
+async function loadResBlob(projectId, meta) {
+  const r = await fetch(blobUrl(projectId, meta.id), { headers: { 'X-App-Token': appToken() } });
+  if (!r.ok) return null;
+  return new Uint8Array(await r.arrayBuffer());
+}
+async function saveResBlob(projectId, meta, bytes) {
+  const r = await fetch(blobUrl(projectId, meta.id), { method: 'PUT', headers: { 'X-App-Token': appToken(), 'Content-Type': 'application/octet-stream' }, body: bytes });
+  if (!r.ok) throw new Error('Không lưu được tệp tài nguyên (HTTP ' + r.status + ')');
+}
+async function deleteResBlob(projectId, resId) {
+  await fetch(blobUrl(projectId, resId), { method: 'DELETE', headers: { 'X-App-Token': appToken() } }).catch(() => {});
+}
+
+function afterResourcesChanged() {
+  const p = app.project;
+  p.rescan(app.ts());
+  app.saveProject();
+  app.refreshAll();
+}
+
+/** Thêm một tệp tài nguyên đi kèm (gói .gz, .html, .js, .json…) vào dự án đang mở */
+export async function addResourceFile(file) {
+  const p = app.project;
+  if (!p) return toast('Hãy nhập card trước', 'warn');
+  if (app.running) return toast('Đang dịch — hãy đợi xong hoặc bấm Dừng', 'warn');
+  const note = toast(`Đang mở "${file.name}" (${formatBytes(file.size)})…`, 'info', 60000);
+  try {
+    const bytes = await readFileBytes(file);
+    const before = p.stats().total;
+    const r = await p.addResource({ name: file.name, origin: 'file' }, bytes);
+    await saveResBlob(p.id, r.meta, bytes);
+    afterResourcesChanged();
+    const layers = p.resourceItems(r.meta.id);
+    const added = p.stats().total - before;
+    note.remove();
+    toast(`Đã thêm tài nguyên "${file.name}": ${layers.length} lớp nội dung, thêm ${added} đoạn cần dịch`, 'ok', 7000);
+    app.log(`Thêm tài nguyên ${file.name} (${formatBytes(bytes.length)}): ${layers.map((it) => `${it.meta.title} [${it.meta.enc}, ${formatBytes(it.meta.size)}]`).join(' · ')}`, 'ok');
+    showTab('resources');
+  } catch (e) {
+    console.error(e);
+    note.remove();
+    toast('Không thêm được tài nguyên: ' + e.message, 'err', 9000);
+  }
+}
+app.addResourceFile = addResourceFile;
+
+export async function removeResource(resId) {
+  const p = app.project;
+  const r = p?.resources.find((x) => x.meta.id === resId);
+  if (!r) return;
+  if (!(await confirmBox(`Gỡ "${r.meta.name}" khỏi dự án?\n(Bản dịch các đoạn của nó vẫn nằm trong bộ nhớ dịch — thêm lại tệp sẽ dùng lại được.)`, 'Gỡ', 'danger'))) return;
+  p.removeResource(resId);
+  await deleteResBlob(p.id, resId);
+  afterResourcesChanged();
+  app.log('Đã gỡ tài nguyên ' + r.meta.name, 'warn');
+}
+app.removeResource = removeResource;
+
+/** Xuất một tệp tài nguyên đã dịch (đúng dạng vỏ gốc: .gz vẫn là .gz, payload base64 / gzip bên trong được mã hóa lại) */
+export async function exportResource(resId) {
+  const p = app.project;
+  if (!p) return;
+  const note = toast('Đang đóng gói tài nguyên đã dịch…', 'info', 120000);
+  try {
+    const ex = await p.exportResource(resId, app.ts());
+    note.remove();
+    if (!ex.changed) toast('Tài nguyên này chưa có gì được dịch — tệp xuất ra giống bản gốc.', 'warn', 6000);
+    download(ex.name, ex.bytes, 'application/octet-stream');
+    app.log(`Đã xuất tài nguyên ${ex.name} (${formatBytes(ex.bytes.length)})`, 'ok');
+  } catch (e) {
+    console.error(e);
+    note.remove();
+    toast('Xuất tài nguyên lỗi: ' + e.message, 'err', 9000);
+  }
+}
+app.exportResource = exportResource;
+
+/** Tải một link ngoài của card (qua máy chủ cục bộ) rồi thêm vào dự án như một tài nguyên để dịch */
+export async function downloadLink(link) {
+  const p = app.project;
+  if (!p) return;
+  if (app.running) return toast('Đang dịch — hãy đợi xong hoặc bấm Dừng', 'warn');
+  const note = toast('Đang tải ' + link.url + ' …', 'info', 120000);
+  try {
+    let bytes = null, mime = '', lastErr = '';
+    for (const u of mirrorUrls(link.url)) {
+      const r = await fetch('/api/fetch', { method: 'POST', headers: { 'X-App-Token': appToken(), 'Content-Type': 'application/json' }, body: JSON.stringify({ url: u }) });
+      if (r.ok) { bytes = new Uint8Array(await r.arrayBuffer()); mime = decodeURIComponent(r.headers.get('X-Content-Type') || ''); break; }
+      lastErr = (await r.json().catch(() => ({}))).error || 'HTTP ' + r.status;
+    }
+    if (!bytes) throw new Error(lastErr || 'không tải được');
+    let name = link.url.replace(/[?#].*$/, '').split('/').filter(Boolean).pop() || 'link';
+    try { name = decodeURIComponent(name); } catch { /* giữ nguyên */ }
+    const r = await p.addResource({ name, origin: 'url', url: link.url, mime, mode: link.klass === 'lib' ? 'keep' : 'inline' }, bytes);
+    await saveResBlob(p.id, r.meta, bytes);
+    afterResourcesChanged();
+    note.remove();
+    const items = p.resourceItems(r.meta.id);
+    const segs = items.reduce((n, it) => n + p.status(it.id).total, 0);
+    toast(`Đã tải "${name}" (${formatBytes(bytes.length)}): ${segs} đoạn cần dịch` + (segs ? '' : ' — không có chữ Hán nào để dịch'), segs ? 'ok' : 'warn', 7000);
+    app.log(`Tải link ${link.url} → ${name} (${formatBytes(bytes.length)}, ${items.length} lớp, ${segs} đoạn)`, 'ok');
+  } catch (e) {
+    console.error(e);
+    note.remove();
+    toast('Không tải được link: ' + e.message, 'err', 9000);
+    app.log(`Tải link thất bại ${link.url}: ${e.message}`, 'error');
+  }
+}
+app.downloadLink = downloadLink;
+
 async function openProject(id, silent) {
   const data = await store.get('projects', id);
   if (!data) throw new Error('Không tìm thấy dự án');
   if (app.project?.dirty) await saveProjectNow();
   const p = new Project(data);
+  await p.prepare((meta) => loadResBlob(id, meta));
   p.rescan(app.ts());
+  for (const r of p.resources) if (r.error) app.log(`Tài nguyên "${r.meta.name}" không mở được: ${r.error}`, 'error');
   app.project = p;
   app.settings.lastProject = id;
   app.saveSettings();
@@ -359,6 +494,8 @@ async function projectsDialog() {
           h('button', { class: 'btn small primary', onclick: async () => { back(); try { await openProject(it.id); showTab('card'); } catch (e) { toast(e.message, 'err'); } } }, 'Mở'), ' ',
           h('button', { class: 'btn small danger', onclick: async () => {
             if (!(await confirmBox('Xóa dự án này? (bản dịch đã lưu sẽ mất)', 'Xóa', 'danger'))) return;
+            // xóa luôn dữ liệu các tệp tài nguyên của dự án (lưu riêng trong data/resources)
+            try { const d = await store.get('projects', it.id); for (const r of d?.resources || []) await deleteResBlob(it.id, r.id); } catch { /* bỏ qua */ }
             await store.del('projects', it.id);
             items = items.filter((x) => x !== it);
             if (app.project?.id === it.id) { app.project = null; app.settings.lastProject = null; app.saveSettings(); app.refreshAll(); }
@@ -455,6 +592,24 @@ export async function translateAll(itemIds, { force = false, problems = false } 
   const conn = app.conn();
   if (!conn.url || !conn.model) { toast('Hãy cấu hình proxy và chọn model ở tab Kết nối', 'warn'); showTab('connect'); return; }
   const ts = app.ts();
+  // khối lượng lớn (thường do tệp tài nguyên / bản đồ hàng trăm nghìn chữ): báo trước để người dùng chủ động chọn phần cần dịch
+  if (!force) {
+    const pend = p.segmentsFor(itemIds).filter((s) => (problems ? !p.tm.has(s.key) || p.data.warnings[s.key] : !p.tm.has(s.key)));
+    const chars = pend.reduce((n, s) => n + s.key.length, 0);
+    if (chars > 150000) {
+      const ids = itemIds || p.items.filter((it) => p.isIncluded(it)).map((it) => it.id);
+      const rows = ids.map((id) => {
+        const it = p.itemById.get(id), a = p.analyses.get(id);
+        let c = 0;
+        const seen = new Set();
+        for (const s of a?.segments || []) if (!p.tm.has(s.key) && !seen.has(s.key)) { seen.add(s.key); c += s.key.length; }
+        return { label: it?.label || id, c };
+      }).filter((x) => x.c > 0).sort((a, b) => b.c - a.c);
+      const batches = Math.ceil(chars / (ts.batchChars || 3000));
+      const ok = await confirmBox(`Sắp gửi AI khoảng ${chars.toLocaleString('vi-VN')} ký tự (${pend.length.toLocaleString('vi-VN')} đoạn, ước chừng ${batches}+ yêu cầu).\n\nNhiều nhất:\n${rows.slice(0, 6).map((r) => `• ${r.label}: ${r.c.toLocaleString('vi-VN')} ký tự`).join('\n')}\n\nMuốn bớt: bỏ tích mục ở cây bên trái tab Card, hoặc ở tab 📦 Tài nguyên chọn "không dịch" cho các trường dữ liệu không cần (vd trích dẫn nguyên văn sử liệu). Bản dịch được lưu dần — có thể bấm Dừng rồi dịch tiếp sau.\n\nTiếp tục dịch?`, 'Dịch');
+      if (!ok) return;
+    }
+  }
   const ac = new AbortController();
   app.running = ac;
   updateTopbar();
@@ -608,6 +763,8 @@ async function exportCard(type) {
   } catch (e) { console.error('check', e); }
   if (notes.length && !(await confirmBox('Lưu ý trước khi xuất:\n' + notes.join('\n') + '\n\nVẫn xuất card?', 'Xuất'))) return;
   try {
+    // mã hóa lại các lớp nhúng (base64 / gzip) và link ngoài đã dịch để ghép vào card
+    if (p.needsPack()) await p.pack(ts);
     const name = (p.buildCard(ts).data?.name || p.cardName || 'card').replace(/[\\/:*?"<>|]+/g, '_');
     if (type === 'json') {
       download(name + '_VI.json', p.exportJson(ts), 'application/json');
@@ -617,6 +774,11 @@ async function exportCard(type) {
       download(name + '_VI.png', p.exportPng(ts, fallback), 'image/png');
     }
     app.log('Đã xuất card ' + type.toUpperCase(), 'ok');
+    const files = p.resources.filter((r) => r.open && r.meta.origin === 'file');
+    const remap = p.resources.filter((r) => r.open && r.meta.origin === 'url' && r.meta.mode === 'remap');
+    if (files.length || remap.length) {
+      toast(`Card này còn ${files.length + remap.length} tệp tài nguyên đi kèm (${[...files, ...remap].slice(0, 3).map((r) => r.meta.name).join(', ')}${files.length + remap.length > 3 ? '…' : ''}) — xuất bản dịch của chúng ở tab 📦 Tài nguyên.`, 'info', 9000);
+    }
   } catch (e) {
     console.error(e);
     toast('Xuất card lỗi: ' + e.message, 'err');

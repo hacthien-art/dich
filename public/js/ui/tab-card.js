@@ -4,8 +4,12 @@ import { GROUPS } from '../core/card.js';
 import { PH_RE } from '../core/analyze.js';
 import { validateSegment, allowedHanSet } from '../core/translate.js';
 import { formatBytes } from '../core/util.js';
+import { listTokens } from '../core/embed.js';
 
-const KIND_LABEL = { name: 'tên', auto: 'văn bản/HTML', initvar: 'InitVar (biến khởi tạo)', code: 'mã script', schema: 'schema Zod', regexFind: 'find regex', keys: 'từ khóa', comment: 'tên mục', list: 'danh sách', button: 'nút script (đồng bộ getButtonEvent)', json: 'dữ liệu JSON (biến Tavern Helper)', trimList: 'trim strings của regex' };
+const KIND_LABEL = { name: 'tên', auto: 'văn bản/HTML', initvar: 'InitVar (biến khởi tạo)', code: 'mã script', schema: 'schema Zod', regexFind: 'find regex', keys: 'từ khóa', comment: 'tên mục', list: 'danh sách', button: 'nút script (đồng bộ getButtonEvent)', json: 'dữ liệu JSON (biến Tavern Helper)', trimList: 'trim strings của regex', html: 'HTML (lớp nhúng / tài nguyên)', js: 'JavaScript (lớp nhúng / tài nguyên)', data: 'JSON / dữ liệu (lớp nhúng / tài nguyên)', css: 'CSS (lớp nhúng / tài nguyên)', text: 'văn bản (lớp nhúng / tài nguyên)' };
+// mục lớn hơn mức này chỉ hiện trích đoạn (ô văn bản hàng chục MB làm treo trình duyệt) và không sửa tay cả mục được
+const VIEW_LIMIT = 200000, VIEW_HEAD = 60000;
+const SEG_PAGE = 150;
 const STATE_LABEL = { done: 'đã dịch', partial: 'dịch một phần', todo: 'chưa dịch', warn: 'đã dịch (có cảnh báo)', manual: 'chỉnh tay', sync: 'chỉ đồng bộ biến', excluded: 'không dịch', none: 'không cần dịch' };
 
 export function create(app, el) {
@@ -132,6 +136,8 @@ export function create(app, el) {
     const book = d.character_book?.entries?.length || 0;
     const rx = d.extensions?.regex_scripts?.length || 0;
     const scripts = p.items.filter((it) => it.group === 'scripts' && it.kind !== 'name').length;
+    const extras = p.items.filter((it) => it.meta?.layer).length;
+    const pendingLinks = p.links().filter((l) => l.klass === 'code' && !l.resource).length;
     const warns = [...new Set([...p.analyses.values()].flatMap((a) => a.warnings))];
     return h('div', null,
       h('div', { class: 'summary card-box' },
@@ -147,6 +153,8 @@ export function create(app, el) {
             h('span', { class: 'pill' }, `${book} mục lorebook`),
             h('span', { class: 'pill' }, `${rx} regex`),
             h('span', { class: 'pill' }, `${scripts} script`),
+            extras ? h('span', { class: 'pill', title: 'Tệp tài nguyên đi kèm, link ngoài đã tải và nội dung nhúng (base64 / nén) — xem tab 📦 Tài nguyên', style: { cursor: 'pointer' }, onclick: () => app.showTab('resources') }, `📦 ${extras} lớp tài nguyên / nhúng`) : null,
+            pendingLinks ? h('span', { class: 'pill warn', title: 'Card nạp mã / giao diện từ link ngoài (GitHub, jsDelivr…) — tải về để dịch ở tab 📦 Tài nguyên', style: { cursor: 'pointer' }, onclick: () => app.showTab('resources') }, `🔗 ${pendingLinks} link ngoài chưa tải`) : null,
             h('span', { class: 'pill key' }, `${dictN} mục từ điển`),
             h('span', { class: 'pill ' + (st.done === st.total ? 'ok' : 'warn') }, `Đã dịch ${st.done}/${st.total} đoạn`),
             st.remainingChars ? h('span', { class: 'pill' }, `còn ${formatBytes(st.remainingChars).replace(' B', '')} ký tự`) : null),
@@ -175,11 +183,19 @@ export function create(app, el) {
     const isArr = Array.isArray(it.text);
     const toText = (v) => (Array.isArray(v) ? v.join('\n') : String(v ?? ''));
     const manual = p.data.overrides[it.id] !== undefined;
+    // mục rất lớn (lớp tài nguyên hàng MB): chỉ hiện trích đoạn, sửa theo từng đoạn ở bảng bên dưới
+    const big = typeof it.text === 'string' && it.text.length > VIEW_LIMIT;
+    const clip = (s) => (big && s.length > VIEW_HEAD ? s.slice(0, VIEW_HEAD) + `\n\n… [còn ${(s.length - VIEW_HEAD).toLocaleString('vi-VN')} ký tự nữa — mục quá lớn nên chỉ hiện phần đầu]` : s);
 
-    const orig = h('textarea', { readonly: true }, toText(it.text));
-    const out = h('textarea', { spellcheck: 'false' }, toText(p.output(it.id)));
-    out.addEventListener('change', () => {
+    const orig = h('textarea', { readonly: true }, clip(toText(it.text)));
+    const out = h('textarea', { spellcheck: 'false', readonly: big }, clip(toText(p.output(it.id))));
+    if (!big) out.addEventListener('change', () => {
       const v = isArr ? out.value.split('\n').map((x) => x.trim()).filter(Boolean) : out.value;
+      // token ⟪emb:…⟫ / ⟪url:…⟫ đại diện cho cả một payload / link: xóa mất là mất luôn nội dung đó
+      if (typeof it.text === 'string') {
+        const lost = listTokens(it.text).filter(([t, id]) => !String(v).includes(`⟪${t}:${id}⟫`));
+        if (lost.length) { toast(`Không lưu: bản chỉnh tay làm mất ${lost.length} ký hiệu ⟪…⟫ (đại diện cho nội dung nhúng / link ngoài) — hãy giữ nguyên chúng.`, 'err', 7000); return; }
+      }
       p.setOverride(it.id, v);
       app.saveProject();
       toast('Đã lưu chỉnh tay cho mục này (ghi đè bản dịch tự động)', 'ok', 2500);
@@ -204,23 +220,36 @@ export function create(app, el) {
         h('button', { class: 'btn small', disabled: !keys.length || !!app.running, onclick: async () => { if (await confirmBox('Dịch lại toàn bộ đoạn của mục này (ghi đè bản dịch hiện có)?', 'Dịch lại')) app.translateAll([it.id], { force: true }); } }, '↻ Dịch lại'),
         h('button', { class: 'btn small', disabled: !keys.some((k) => p.tm.has(k)), onclick: async () => { if (await confirmBox('Xóa bản dịch các đoạn của mục này?', 'Xóa', 'danger')) { p.clearTranslations(keys); app.saveProject(); renderEditor(); liveUpdate(); } } }, '✕ Xóa bản dịch'),
         manual ? h('button', { class: 'btn small', onclick: () => { p.setOverride(it.id, undefined); app.saveProject(); renderEditor(); liveUpdate(); } }, '⟲ Bỏ chỉnh tay') : null,
-        isHtml && it.group !== 'scripts' ? h('button', { class: 'btn small', onclick: () => { app.tabs.preview.focusItem?.(it); app.showTab('preview'); } }, '👁 Xem trước') : null,
+        isHtml && it.group !== 'scripts' && !it.meta?.layer ? h('button', { class: 'btn small', onclick: () => { app.tabs.preview.focusItem?.(it); app.showTab('preview'); } }, '👁 Xem trước') : null,
         h('span', { class: 'muted small' }, keys.length ? `${st.done}/${st.total} đoạn đã dịch` : (it.kind === 'regexFind' ? 'Mục này chỉ đồng bộ nhãn (marker) theo từ điển, không dịch bằng AI' : 'Không có đoạn cần dịch — chỉ đồng bộ biến')),
       ),
-      a.warnings.length ? h('div', { class: 'card-box tight' }, a.warnings.map((w) => h('div', { class: 'warn small' }, '⚠ ' + w))) : null,
+      a.warnings.length ? h('div', { class: 'card-box tight' }, a.warnings.slice(0, 12).map((w) => h('div', { class: 'warn small' }, '⚠ ' + w)), a.warnings.length > 12 ? h('div', { class: 'muted small' }, `… và ${a.warnings.length - 12} cảnh báo khác`) : null) : null,
       manual ? h('div', { class: 'card-box tight warn small' }, 'Mục này đang dùng bản chỉnh tay. Thay đổi bảng biến/đoạn dịch sẽ không tự áp dụng cho tới khi bấm "Bỏ chỉnh tay".') : null,
+      layerInfo(it),
+      tokenLegend(it),
       h('div', { class: 'split' },
-        h('div', null, h('h4', null, 'Bản gốc'), orig),
-        h('div', null, h('h4', null, 'Bản dịch (sửa trực tiếp = chỉnh tay)'), out)),
+        h('div', null, h('h4', null, 'Bản gốc' + (big ? ' (trích đoạn)' : '')), orig),
+        h('div', null, h('h4', null, big ? 'Bản dịch (trích đoạn — sửa theo từng đoạn ở bảng dưới)' : 'Bản dịch (sửa trực tiếp = chỉnh tay)'), out)),
     );
 
     if (keys.length) {
       const segWrap = h('div');
+      const segOf = new Map(a.segments.map((s) => [s.key, s]));
+      let page = 0, q = '', onlyBad = false;
       const renderSegs = () => {
         clear(segWrap);
-        const tbl = h('table', { class: 'tbl seg-table' }, h('tr', null, h('th', null, '#'), h('th', null, 'Đoạn gốc (⟦n⟧ = mã/thẻ/biến được giữ nguyên)'), h('th', null, 'Bản dịch'), h('th', null, '')));
+        const nq = q.trim().toLowerCase();
+        const list = [];
         keys.forEach((k, i) => {
-          const seg = a.segments.find((s) => s.key === k);
+          if (onlyBad && p.tm.has(k) && !p.data.warnings[k]) return;
+          if (nq && !k.toLowerCase().includes(nq) && !(p.tm.get(k) || '').toLowerCase().includes(nq)) return;
+          list.push([k, i]);
+        });
+        const pages = Math.max(1, Math.ceil(list.length / SEG_PAGE));
+        if (page >= pages) page = pages - 1;
+        const tbl = h('table', { class: 'tbl seg-table' }, h('tr', null, h('th', null, '#'), h('th', null, 'Đoạn gốc (⟦n⟧ = mã/thẻ/biến được giữ nguyên)'), h('th', null, 'Bản dịch'), h('th', null, '')));
+        list.slice(page * SEG_PAGE, (page + 1) * SEG_PAGE).forEach(([k, i]) => {
+          const seg = segOf.get(k);
           const tr = p.tm.get(k);
           const ta = h('textarea', { rows: Math.min(8, Math.max(1, Math.ceil(k.length / 60))), placeholder: '(chưa dịch)' }, tr ?? '');
           const stEl = h('span', { class: 'small ' + (tr == null ? 'muted' : p.data.warnings[k] ? 'warn' : 'ok') }, tr == null ? '—' : p.data.warnings[k] ? '⚠ ' + p.data.warnings[k] : '✓');
@@ -231,7 +260,7 @@ export function create(app, el) {
             if (!val.ok && !val.soft) { toast('Không lưu: ' + val.reason + '. Bản dịch phải giữ đủ các ⟦n⟧.', 'err', 5000); return; }
             p.setTranslation(k, val.out ?? v, val.ok ? val.warn : val.reason);
             app.saveProject();
-            out.value = toText(p.output(it.id));
+            if (!big) out.value = toText(p.output(it.id));
             stEl.textContent = '✓ (sửa tay)'; stEl.className = 'small ok';
             liveUpdate();
           });
@@ -242,13 +271,64 @@ export function create(app, el) {
             h('td', null, ta),
             h('td', null, stEl)));
         });
+        if (!list.length) tbl.appendChild(h('tr', null, h('td', { colspan: 4, class: 'muted' }, 'Không có đoạn nào khớp bộ lọc')));
         segWrap.appendChild(h('div', { class: 'table-wrap' }, tbl));
+        if (pages > 1 || nq || onlyBad) {
+          segWrap.appendChild(h('div', { class: 'row', style: { marginTop: '6px' } },
+            h('span', { class: 'muted small' }, `${list.length.toLocaleString('vi-VN')} đoạn · trang ${page + 1}/${pages}`),
+            h('button', { class: 'btn small', disabled: page === 0, onclick: () => { page--; renderSegs(); } }, '‹ Trước'),
+            h('button', { class: 'btn small', disabled: page >= pages - 1, onclick: () => { page++; renderSegs(); } }, 'Sau ›')));
+        }
       };
-      const det = h('details', { open: keys.length <= 40 }, h('summary', { style: { cursor: 'pointer', margin: '16px 0 8px', fontWeight: 600 } }, `Các đoạn dịch (${keys.length}) — sửa từng đoạn, bảng biến vẫn tự đồng bộ`), segWrap);
+      // bộ lọc (chỉ cần khi nhiều đoạn): tìm trong bản gốc / bản dịch, chỉ hiện đoạn chưa dịch hoặc có cảnh báo
+      let tools = null;
+      if (keys.length > 40) {
+        const search = h('input', { type: 'search', placeholder: 'Tìm trong đoạn gốc / bản dịch…', style: { maxWidth: '280px' } });
+        let timer = 0;
+        search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { q = search.value; page = 0; renderSegs(); }, 200); });
+        const bad = h('input', { type: 'checkbox' });
+        bad.addEventListener('change', () => { onlyBad = bad.checked; page = 0; renderSegs(); });
+        tools = h('div', { class: 'row', style: { marginBottom: '6px' } }, search, h('label', { class: 'check small', style: { margin: 0 } }, bad, 'Chỉ đoạn chưa dịch / có cảnh báo'));
+      }
+      const det = h('details', { open: keys.length <= 40 }, h('summary', { style: { cursor: 'pointer', margin: '16px 0 8px', fontWeight: 600 } }, `Các đoạn dịch (${keys.length.toLocaleString('vi-VN')}) — sửa từng đoạn, bảng biến vẫn tự đồng bộ`), tools, segWrap);
       det.addEventListener('toggle', () => { if (det.open && !segWrap.firstChild) renderSegs(); });
       if (det.open) renderSegs();
       editorEl.append(det);
     }
+  }
+
+  /** Thông tin lớp nhúng / tài nguyên: mã hóa, kích thước, thuộc mục nào */
+  function layerInfo(it) {
+    if (!it.meta?.layer) return null;
+    const p = app.project;
+    const parent = it.meta.parent ? p.itemById.get(it.meta.parent) : null;
+    return h('div', { class: 'card-box tight small' },
+      h('span', { class: 'pill' }, it.meta.enc || 'lớp'), ' ',
+      h('span', { class: 'pill' }, formatBytes(it.meta.size || it.text.length).replace(' B', ' ký tự')), ' ',
+      parent ? h('span', null, 'Nằm trong: ', h('a', { href: '#', onclick: (e) => { e.preventDefault(); selectItem(parent.id); } }, parent.label), ' ') : null,
+      h('span', { class: 'muted' }, 'Lớp này được dịch nhất quán: mỗi chuỗi lặp lại chỉ dịch một lần; URL và mã định danh lẫn chữ Hán được giữ nguyên. '),
+      h('a', { href: '#', onclick: (e) => { e.preventDefault(); app.showTab('resources'); } }, 'Xem ở tab 📦 Tài nguyên'));
+  }
+
+  /** Giải thích các ký hiệu ⟪emb:…⟫ / ⟪url:…⟫ trong mục: mỗi ký hiệu đại diện cho một payload nhúng / link ngoài */
+  function tokenLegend(it) {
+    if (typeof it.text !== 'string') return null;
+    const p = app.project;
+    const seen = new Set(), rows = [];
+    for (const [type, id] of listTokens(it.text)) {
+      const key = type + ':' + id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (type === 'emb') {
+        const L = p.layers.get(id);
+        if (L) rows.push(h('div', null, h('span', { class: 'mono' }, `⟪emb:${id}⟫`), ` = ${L.item.meta.enc}, ${formatBytes(L.part.rawLen).replace(' B', ' ký tự')} → `, h('a', { href: '#', onclick: (e) => { e.preventDefault(); selectItem(L.item.id); } }, 'mở lớp này')));
+      } else {
+        const r = p.urlRes.get(id);
+        if (r) rows.push(h('div', null, h('span', { class: 'mono' }, `⟪url:${id}⟫`), ` = link ${r.meta.url} → `, h('a', { href: '#', onclick: (e) => { e.preventDefault(); selectItem('res.' + r.meta.id); } }, 'mở nội dung đã tải')));
+      }
+    }
+    if (!rows.length) return null;
+    return h('div', { class: 'card-box tight small' }, h('b', null, `Mục này chứa ${rows.length} nội dung nhúng / link ngoài`), h('span', { class: 'muted' }, ' — trong văn bản chúng được thay bằng ký hiệu ⟪…⟫ (giữ nguyên khi sửa tay); khi xuất, bản dịch của từng lớp được mã hóa lại và đặt về đúng chỗ.'), rows.slice(0, 12), rows.length > 12 ? h('div', { class: 'muted' }, `… và ${rows.length - 12} ký hiệu khác`) : null);
   }
 
   function describeHole(hh) {

@@ -8,6 +8,8 @@ export const GROUPS = {
   lorebook: 'Lorebook / World Info',
   regex: 'Regex',
   scripts: 'Script Tavern Helper',
+  embedded: 'Nội dung nhúng (base64 / nén)',
+  resources: 'Tài nguyên đi kèm & link ngoài',
 };
 
 const BASIC_FIELDS = [

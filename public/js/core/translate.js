@@ -105,11 +105,14 @@ export function stripGlossaryTags(out, key = '') {
 /** Chia các đoạn chưa dịch thành lô */
 export function makeBatches(segs, maxChars = 3000, maxSegs = 60) {
   const batches = [];
-  let cur = [], size = 0;
+  let cur = [], size = 0, units = 0;
   for (const s of segs) {
     const len = s.key.length;
-    if (cur.length && (size + len > maxChars || cur.length >= maxSegs)) { batches.push(cur); cur = []; size = 0; }
-    cur.push(s); size += len;
+    // đoạn rất ngắn (tên riêng, nhãn 2-3 chữ của bảng dữ liệu / bản đồ) chỉ tính 1/4 "suất": một lô chứa được nhiều tên
+    // hơn, đỡ tốn hàng trăm yêu cầu mà mỗi yêu cầu chỉ mang vài chục ký tự
+    const unit = len <= 12 ? 0.25 : 1;
+    if (cur.length && (size + len > maxChars || units + unit > maxSegs || cur.length >= 320)) { batches.push(cur); cur = []; size = 0; units = 0; }
+    cur.push(s); size += len; units += unit;
   }
   if (cur.length) batches.push(cur);
   return batches;

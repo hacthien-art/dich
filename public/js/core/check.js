@@ -1,7 +1,8 @@
 // Kiểm tra tổng thể card SAU DỊCH: chữ Hán còn sót (toàn bộ card, không chỉ các đoạn đã gửi AI), từ điển,
 // EJS / script còn biên dịch được, InitVar YAML, đồng bộ đường dẫn biến, regex còn khớp, tên mục lorebook,
 // bảo toàn cấu trúc ($1, macro, thẻ HTML). Chạy được cả trên trình duyệt lẫn Node (kiểm thử).
-import { lexHtml } from './lexer.js';
+import { lexHtml, walkData } from './lexer.js';
+import { listTokens } from './embed.js';
 import { hasCJK, HAN_CLASS, truncate } from './util.js';
 import { makeDictIndex, dictProblems, findConflicts, isKeptEntry } from './dict.js';
 import { allowedHanSet, stripGlossaryTags } from './translate.js';
@@ -225,13 +226,18 @@ export function scanHan(p, settings = p.settings) {
     const an = p.analyses.get(it.id);
     // giữ tiếng Trung theo thiết kế: mục người dùng không cho dịch, tên mục bị mã ghép động, từ khóa gốc (chế độ giữ + thêm)
     const designed = !p.isIncluded(it, settings) || !!an?.pinned || (it.kind === 'keys' && (settings.keysMode || 'append') !== 'replace');
-    let trBlob = null, todoBlob = null;
+    // lớp lớn (tài nguyên hàng chục MB, hàng chục nghìn cụm): tra theo TẬP các cụm chữ Hán thay vì dò chuỗi con
+    const big = text.length > 300000;
+    let trBlob = null, todoBlob = null, trSet = null, todoSet = null;
     const blobs = () => {
       if (trBlob != null) return;
       const tr = [], todo = [];
       for (const s of an?.segments || []) { const t = p.tm.get(s.key); if (t == null) todo.push(s.key); else tr.push(t); }
       trBlob = tr.join('\n'); todoBlob = todo.join('\n');
+      if (big) { trSet = new Set(trBlob.match(HAN_RUN()) || []); todoSet = new Set(todoBlob.match(HAN_RUN()) || []); }
     };
+    const inTr = (w) => (big ? trSet.has(w) : !!trBlob && trBlob.includes(w));
+    const inTodo = (w) => (big ? todoSet.has(w) : !!todoBlob && todoBlob.includes(w));
     const src = typeof it.text === 'string' ? it.text : '';
     const row = { itemId: it.id, label: it.label, group: it.group, count: 0, chars: 0, cats: {}, samples: [] };
     const re = HAN_RUN();
@@ -243,9 +249,9 @@ export function scanHan(p, settings = p.settings) {
       else if (fontContext(text, i)) cat = 'font';
       else {
         blobs();
-        if (trBlob && trBlob.includes(w)) cat = 'ai';
+        if (inTr(w)) cat = 'ai';
         else if (untrans.has(w) || (idx.kindOf(w) && idx.lookup(w) === w && !isKeptEntry(p.data.dict[w], settings))) cat = 'dict';
-        else if (todoBlob && todoBlob.includes(w)) cat = 'todo';
+        else if (inTodo(w)) cat = 'todo';
         else cat = 'code';
       }
       row.cats[cat] = (row.cats[cat] || 0) + 1;
@@ -253,7 +259,7 @@ export function scanHan(p, settings = p.settings) {
       if (cat === 'font' || cat === 'design') continue;
       row.count++; row.chars += w.length;
       if (row.samples.length < 6) row.samples.push({ cat, text: text.slice(Math.max(0, i - 26), i + w.length + 18).replace(/\s+/g, ' ') });
-      if (cat === 'code') {
+      if (cat === 'code' && !big) {
         const lit = enclosingLiteral(text, i, i + w.length);
         const key = lit && src.includes(lit.quote + lit.text + lit.quote) ? lit.text : null;
         if (key) { let e = lits.get(key); if (!e) { e = { text: key, count: 0, items: new Set() }; lits.set(key, e); } e.count++; e.items.add(it.id); }
@@ -283,7 +289,9 @@ export function runChecks(p, settings = p.settings, { deadlineMs = 6000 } = {}) 
   const t0 = Date.now();
   const sections = [];
   const sec = (id, title) => {
-    const s = { id, title, level: 'ok', summary: '', findings: [], more: 0 };
+    const now = Date.now();
+    if (sections.length) sections[sections.length - 1].ms = now - sections[sections.length - 1].t0;
+    const s = { id, title, level: 'ok', summary: '', findings: [], more: 0, t0: now };
     sections.push(s);
     s.add = (level, text, itemId, detail) => {
       if (LEVEL_RANK[level] > LEVEL_RANK[s.level]) s.level = level;
@@ -431,7 +439,7 @@ export function runChecks(p, settings = p.settings, { deadlineMs = 6000 } = {}) 
     const s = sec('js', 'Mã JavaScript (script trong HTML, Tavern Helper)');
     let n = 0;
     for (const it of strItems) {
-      if (it.kind === 'code' || it.kind === 'schema') {
+      if (it.kind === 'code' || it.kind === 'schema' || it.kind === 'js') {
         if (jsSyntaxError(it.text, true)) continue;
         n++;
         const e = jsSyntaxError(out(it), true);
@@ -551,7 +559,40 @@ export function runChecks(p, settings = p.settings, { deadlineMs = 6000 } = {}) 
     s.summary = `${n} mục đã so cấu trúc` + (s.level === 'ok' ? ', không mất thành phần nào' : '');
   }
 
+  // ------------------------------------------------------------ 11) nội dung nhúng · tài nguyên đi kèm · link ngoài
+  {
+    const layered = p.items.filter((it) => typeof it.text === 'string' && (it.meta?.layer || it.rawText !== undefined));
+    const links = typeof p.links === 'function' ? p.links() : [];
+    const pending = links.filter((l) => l.klass === 'code' && !l.resource);
+    if (layered.length || pending.length || (p.resources || []).length) {
+      const s = sec('layers', 'Nội dung nhúng · tài nguyên đi kèm · link ngoài');
+      let data = 0;
+      for (const it of layered) {
+        const o = out(it);
+        // token của lớp con phải còn đủ: mất token = mất luôn cả payload / link mà nó đại diện
+        const lost = diffMultiset(multiset(listTokens(it.text).map((x) => x.join(':'))), multiset(listTokens(o).map((x) => x.join(':'))));
+        if (lost.length) s.add('error', `${it.label}: mất ${lost.length} token ⟪…⟫ của nội dung nhúng (payload / link tương ứng sẽ biến mất) — bỏ chỉnh tay hoặc dịch lại mục này`, it.id);
+        if (it.kind === 'data') {
+          const bounds = (t) => { let a = 0, b = t.length; while (a < b && (/\s/.test(t[a]) || t.charCodeAt(a) === 0xfeff)) a++; while (b > a && /\s/.test(t[b - 1])) b--; return [a, b]; };
+          const [a0, b0] = bounds(it.text);
+          if (walkData(it.text, a0, b0, null) !== b0) continue; // bản gốc không phải dữ liệu thuần -> không kết luận
+          data++;
+          const [a1, b1] = bounds(o);
+          if (walkData(o, a1, b1, null) !== b1) s.add('error', `${it.label}: dữ liệu JSON hỏng cấu trúc sau dịch`, it.id);
+        }
+      }
+      for (const r of p.resources || []) if (r.error) s.add('error', `Tệp tài nguyên "${r.meta.name}" không mở được: ${r.error}`);
+      for (const r of p.resources || []) {
+        if (r.open && r.meta.origin === 'url' && (r.meta.mode || 'inline') === 'inline' && r.open.container !== 'plain') s.add('warn', `Link "${truncate(r.meta.url, 80)}" trỏ tới tệp nén — không nhúng lại được bằng data: URL; hãy xuất tệp đã dịch, tự đăng tải rồi chọn "Đổi sang URL khác"`);
+      }
+      if (pending.length) s.add('info', `${pending.length} link ngoài tới mã / dữ liệu riêng của card chưa được tải về để dịch (tab 📦 Tài nguyên): ${pending.slice(0, 4).map((l) => truncate(l.url, 70)).join(' · ')}${pending.length > 4 ? '…' : ''}`);
+      const nLayers = layered.filter((it) => it.meta?.layer).length;
+      s.summary = `${nLayers} lớp nhúng / tài nguyên` + (data ? `, ${data} khối dữ liệu còn đúng cấu trúc` : '') + (s.level === 'ok' || s.level === 'info' ? ', không mất token nào' : '') + (pending.length ? ` · ${pending.length} link chưa tải` : '');
+    }
+  }
+
   const totals = { error: 0, warn: 0, info: 0 };
-  for (const s of sections) { for (const f of s.findings) totals[f.level] = (totals[f.level] || 0) + 1; delete s.add; }
+  if (sections.length) sections[sections.length - 1].ms = Date.now() - sections[sections.length - 1].t0;
+  for (const s of sections) { for (const f of s.findings) totals[f.level] = (totals[f.level] || 0) + 1; delete s.add; delete s.t0; }
   return { sections, totals, han, ms: Date.now() - t0 };
 }

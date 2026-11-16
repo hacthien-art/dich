@@ -1,11 +1,20 @@
 // Từ điển đồng bộ: quét biến MVU (InitVar, schema Zod, đường dẫn), giá trị enum, marker regex, thuật ngữ.
 // Mỗi mục: { src, kind: key|value|marker|term, dst, keep, manual, count, parents:Set, samples:[] }
 import { load as yamlLoad } from '../../vendor/js-yaml.mjs';
-import { lexJs, significant } from './lexer.js';
+import { lexJs, lexHtml, significant } from './lexer.js';
 import { hasCJK, HAN_CLASS, forEachDotChain } from './util.js';
 import { isInitVarEntry } from './card.js';
 
 const KIND_RANK = { key: 4, value: 3, marker: 2, term: 1 };
+// hàm so khớp / tra cứu: chuỗi tiếng Trung truyền vào là "mã định danh" phải khớp với dữ liệu
+const MATCH_FUNCS = new Set(['includes', 'startsWith', 'endsWith', 'indexOf', 'lastIndexOf', 'has', 'get', 'set', 'delete', 'add', 'test', 'match', 'matchAll', 'search', 'replace', 'replaceAll', 'findIndex', 'Set', 'Map']);
+const SLUG_STOP = /[\s·、，。：；！？（）《》「」『』【】…—]/;
+/** Mã định danh lẫn chữ Hán (pref-nanjing-松江府, 明史/卷6) hoặc URL — không đưa vào từ điển (giống isSlugLike / isUrlLike ở analyze.js) */
+function isIdLike(s) {
+  if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(s) || /^(?:data|blob):/i.test(s)) return true;
+  if (SLUG_STOP.test(s)) return false;
+  return /^[A-Za-z0-9]+[-_/:.][^\s]+$/.test(s) || /^[^\s]+[-_/:.][A-Za-z0-9]+$/.test(s);
+}
 const OBJECT_PREV = new Set(['(', ',', '=', ':', '[', '?', 'return', '=>(', '||', '&&', '??', '...', 'const', 'let', 'var']);
 
 export const NAMING_STYLES = {
@@ -203,6 +212,115 @@ class Scanner {
     while ((m = re2.exec(text))) if (isShortValue(m[2])) this.add(m[2], 'value', null, label);
   }
 
+  // ------------------------------------------------------------------ lớp tài nguyên / nội dung nhúng
+  /**
+   * Mã trong tệp tài nguyên (bản đồ, giao diện tải từ link ngoài, payload base64…) so khớp chuỗi tiếng Trung với DỮ LIỆU
+   * của chính nó và với biến của card. Để sau dịch hai bên vẫn khớp, mọi chuỗi / định danh tiếng Trung đóng vai "mã định
+   * danh" trong mã được đưa vào từ điển -> được thay bằng CÙNG một bản dịch ở mọi nơi (mã, dữ liệu, card):
+   *   .名  obj['名']  { 名: … }  === '名'  case '名':  ['名', '名']  x.includes('名')  new Set(['名'])  /名|名/
+   * Chuỗi hiển thị thông thường (không ở các vị trí trên) không vào từ điển — chúng được dịch qua bộ nhớ dịch.
+   */
+  scanLayer(text, kind, label) {
+    if (!text || !hasCJK(text)) return;
+    if (kind === 'js') { this.scanCode(text, 0, text.length, label); return; }
+    if (kind !== 'html') return;
+    for (const t of lexHtml(text)) {
+      if (t.type === 'tag') {
+        for (const at of t.attrs || []) {
+          if (at.vStart < 0) continue;
+          const name = at.name.toLowerCase();
+          const v = text.slice(at.vStart, at.vEnd).trim();
+          if (!hasCJK(v)) continue;
+          if (name.startsWith('on')) this.scanCode(text, at.vStart, at.vEnd, label);
+          // value / data-* ngắn: mã đọc lại bằng .value / dataset rồi đem so với dữ liệu
+          else if ((name === 'value' || name.startsWith('data-')) && isShortValue(v) && !isIdLike(v)) this.add(v, 'value', null, label);
+        }
+      } else if (t.type === 'raw' && t.tag === 'script') {
+        const ta = (t.attrs || []).find((a) => a.name.toLowerCase() === 'type');
+        const type = ta && ta.vStart >= 0 ? text.slice(ta.vStart, ta.vEnd).toLowerCase() : '';
+        if (!type || /javascript|module|babel|jsx/.test(type)) this.scanCode(text, t.start, t.end, label);
+      }
+    }
+  }
+
+  scanCode(src, start, end, label) {
+    const toks = lexJs(src, start, end, { data: true });
+    this.scanTokens(src, significant(toks), label);
+    // đường dẫn biến (stat_data.x.y, _.set('a.b')…) trong các đoạn MÃ — bỏ qua các khối dữ liệu lớn
+    let pos = start;
+    const chunk = (a, b) => { if (b - a > 8) { const s = src.slice(a, b); if (hasCJK(s)) this.scanPaths(s, label); } };
+    for (const t of toks) if (t.type === 'data') { chunk(pos, t.start); pos = t.end; }
+    chunk(pos, end);
+  }
+
+  scanTokens(src, sig, label) {
+    const stack = []; // '(' kèm tên hàm được gọi | '[' | '{'
+    const short = (s) => isShortValue(s) && !s.includes('\\') && !isIdLike(s);
+    for (let i = 0; i < sig.length; i++) {
+      const t = sig[i], prev = sig[i - 1], next = sig[i + 1];
+      const pv = prev && (prev.type === 'punct' || prev.type === 'ident') ? prev.value : null;
+      const nv = next && (next.type === 'punct' || next.type === 'ident') ? next.value : null;
+      if (t.type === 'punct') {
+        if (t.value === '(') stack.push(prev?.type === 'ident' ? '(' + prev.value : '(');
+        else if (t.value === '[' || t.value === '{') stack.push(t.value);
+        else if (t.value === ')' || t.value === ']' || t.value === '}') stack.pop();
+        continue;
+      }
+      const top = stack.length ? stack[stack.length - 1] : '';
+      if (t.type === 'tmpl') {
+        for (const p of t.parts || []) if (p.type === 'expr' && p.tokens) this.scanTokens(src, significant(p.tokens), label);
+        continue;
+      }
+      if (t.type === 'ident') {
+        if (!hasCJK(t.value)) continue;
+        if (pv === '.' || pv === '?.') this.add(t.value, 'key', null, label);
+        else if (top === '{' && (pv === '{' || pv === ',') && (nv === ':' || nv === ',' || nv === '}')) this.add(t.value, 'key', null, label);
+        continue;
+      }
+      if (t.type === 'str') {
+        const s = src.slice(t.cStart, t.cEnd);
+        if (!hasCJK(s) || !short(s)) continue;
+        if (top === '{' && (pv === '{' || pv === ',') && nv === ':') { this.add(s, 'key', null, label); continue; }
+        if (pv === '[' && nv === ']' && sig[i - 2] && (sig[i - 2].type === 'ident' || [')', ']'].includes(sig[i - 2].value))) { this.add(s, 'key', null, label); continue; }
+        if (['===', '!==', '==', '!='].includes(pv) || ['===', '!==', '==', '!='].includes(nv) || pv === 'case' || nv === 'in') { this.add(s, 'value', null, label); continue; }
+        if (top === '[' && (pv === '[' || pv === ',') && (nv === ',' || nv === ']')) { this.add(s, 'value', null, label); continue; }
+        if (top[0] === '(' && MATCH_FUNCS.has(top.slice(1)) && (pv === '(' || pv === ',')) this.add(s, 'value', null, label);
+        continue;
+      }
+      if (t.type === 'regex') {
+        const body = src.slice(t.start + 1, src.lastIndexOf('/', t.end - 1));
+        if (hasCJK(body)) this.scanRegexWords(body, label);
+      }
+    }
+  }
+
+  /** Các cụm chữ Hán (≥ 2 chữ) trong thân regex literal — vd /稳固控制|实际控制|直辖/.test(status) */
+  scanRegexWords(body, label) {
+    const runRe = new RegExp('[' + HAN_CLASS + '\\u3040-\\u30FF]');
+    let inClass = false;
+    for (let i = 0; i < body.length;) {
+      const c = body[i];
+      if (c === '\\') {
+        if (body[i + 1] === 'k' && body[i + 2] === '<') { const close = body.indexOf('>', i); i = close > 0 ? close + 1 : i + 2; } else i += 2;
+        continue;
+      }
+      if (inClass) { if (c === ']') inClass = false; i++; continue; }
+      if (c === '[') { inClass = true; i++; continue; }
+      if (c === '(' && body[i + 1] === '?' && body[i + 2] === '<' && body[i + 3] !== '=' && body[i + 3] !== '!') {
+        const close = body.indexOf('>', i + 3);
+        if (close > 0) { i = close + 1; continue; }
+      }
+      if (runRe.test(c)) {
+        let j = i;
+        while (j < body.length && runRe.test(body[j])) j++;
+        // cụm đứng trước lượng từ (了?  字+) : chữ cuối thuộc về lượng từ -> không coi là một từ
+        if (j - i >= 2 && !/[?*+{]/.test(body[j] || '')) this.add(body.slice(i, j), 'value', null, label);
+        i = j; continue;
+      }
+      i++;
+    }
+  }
+
   scanMarkers(findRegex, label) {
     if (!findRegex || !hasCJK(findRegex)) return;
     const runRe = new RegExp('[' + HAN_CLASS + '\\u3040-\\u30FF]');
@@ -261,9 +379,11 @@ export function scanCard(card, items) {
     if (it.kind === 'json') { try { sc.walkData(JSON.parse(it.text), [it.meta?.root || 'tavern_helper']); } catch { /* bỏ qua */ } }
     else if (it.kind === 'button') sc.add(it.text, 'value', null, it.label);
   }
+  // 2c) lớp tài nguyên / nội dung nhúng: mã định danh tiếng Trung trong MÃ của lớp
+  for (const it of items) if (it.meta?.layer && typeof it.text === 'string') sc.scanLayer(it.text, it.kind, it.label);
   // 3) đường dẫn + so sánh trong mọi văn bản
   for (const it of items) {
-    if (typeof it.text !== 'string' || it.kind === 'json' || it.kind === 'button') continue;
+    if (typeof it.text !== 'string' || it.kind === 'json' || it.kind === 'button' || it.meta?.layer) continue;
     sc.scanPaths(it.text, it.label);
     if (it.kind !== 'initvar') sc.scanComparisons(it.text, it.label);
     if (it.kind === 'auto' || it.kind === 'initvar') sc.scanPlaceholders(it.text, it.label);

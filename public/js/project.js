@@ -5,11 +5,36 @@ import { analyzeItem, findDynamicEntryRefs } from './core/analyze.js';
 import { validateSegment, allowedHanSet, stripGlossaryTags } from './core/translate.js';
 import { collectGuardChars, runChecks } from './core/check.js';
 import { legacyVariants, ParaMemory, subSegment } from './core/reuse.js';
-import { uuid, hasCJK, deepClone } from './core/util.js';
+import { uuid, hasCJK, deepClone, hash32 } from './core/util.js';
 import { utf8ToBase64, verifyPng, isPng } from './core/png.js';
+import { unpackText, encodePart, resolveTokens, listTokens, hasToken, unescapeCjk, unescapeCjkInScripts, describeEncoding, stableId } from './core/embed.js';
+import { openResource, packResource, exportName } from './core/resource.js';
+import { scanLinks, tokenizeUrls, toDataUrl } from './core/links.js';
 
 /** Phiên bản cách đặt khóa đoạn dịch của bộ phân tích. Tăng lên khi khóa thay đổi -> dự án cũ được chuyển bản dịch 1 lần. */
 export const ANALYZER_VERSION = 2;
+
+/** Lớp (tài nguyên / nội dung nhúng) từ cỡ này trở lên: nhớ kết quả phân tích, giao diện chỉ hiện trích đoạn */
+export const BIG_ITEM = 200000;
+
+/**
+ * Bóc nội dung NHÚNG (base64, base64 + gzip, data: URI, payload cắt khúc) trong các mục văn bản của card, và đổi chữ Hán
+ * viết dạng \uXXXX trong mã về ký tự thật. Trả về Map(itemId -> { src, text, parts }) — text là văn bản đã thay payload
+ * bằng token ⟪emb:id⟫; mỗi payload (và payload lồng bên trong) thành một "lớp" được dịch như một mục riêng.
+ */
+export async function unpackCardItems(card) {
+  const out = new Map();
+  const seen = new Map();
+  for (const it of listItems(card)) {
+    if (typeof it.text !== 'string' || it.text.length < 48) continue;
+    if (it.kind === 'regexFind' || it.kind === 'name' || it.kind === 'comment' || it.kind === 'button' || it.kind === 'json') continue;
+    let u;
+    try { u = await unpackText(it.text, { seen }); } catch { continue; }
+    const text = it.kind === 'code' || it.kind === 'schema' ? unescapeCjk(u.text) : it.kind === 'auto' ? unescapeCjkInScripts(u.text) : u.text;
+    if (u.parts.length || text !== it.text) out.set(it.id, { src: it.text, text, parts: u.parts });
+  }
+  return out;
+}
 
 export const DEFAULT_TRANSLATE_SETTINGS = {
   usePresetPrompts: false,
@@ -52,6 +77,8 @@ function itemNameSig(it) {
   return it.id;
 }
 function itemTextSig(it) {
+  // lớp tài nguyên / nội dung nhúng: so bằng mã băm nội dung (văn bản có thể tới hàng chục MB)
+  if (it.sig) return [it.kind, 'layer', it.sig].join('\u0000');
   return [it.kind, itemField(it), Array.isArray(it.text) ? JSON.stringify(it.text) : String(it.text ?? '')].join('\u0000');
 }
 
@@ -107,13 +134,21 @@ export class Project {
     this.data.excluded ||= {};
     this.data.glossary ||= [];
     this.data.warnings ||= {};
+    this.data.resources ||= [];   // tệp tài nguyên đi kèm / link ngoài đã tải: [{ id, name, size, origin, url, mode, remapUrl, mime }]
+    this.data.keepFields ||= {};  // itemId của lớp -> [tên trường dữ liệu không dịch]
     this.card = makeCard(data.card, { fileName: data.fileName, format: data.format, image: data.imageB64 ? b64ToBytes(data.imageB64) : null });
     this.tm = new Map(Object.entries(this.data.tm));
-    this.items = listItems(this.card);
-    this.itemById = new Map(this.items.map((it) => [it.id, it]));
+    this.baseItems = listItems(this.card); // các mục của chính card (không gồm lớp nhúng / tài nguyên)
+    this.cardEmbeds = new Map();           // itemId -> { src, text, parts } (xem unpackCardItems)
+    this.resources = [];                   // [{ meta, open, error }] — open = kết quả openResource()
+    this.layers = new Map();               // id payload -> { part, item, resId }
+    this.urlRes = new Map();               // id của URL -> tài nguyên tải từ link đó
+    this.packed = new Map();               // 'emb:id' | 'url:id' -> { sig, value } (payload đã mã hóa lại sau dịch)
+    this.anCache = new Map();
     this.version = 0;
     this.analyses = new Map();
     this.scan = null;
+    this.rebuildItems();
   }
 
   static fromFile(card, fileName) {
@@ -135,6 +170,249 @@ export class Project {
   get id() { return this.data.id; }
   get name() { return this.data.name; }
   get cardName() { return this.card.raw.data?.name || ''; }
+
+  // ------------------------------------------------------------------ nội dung nhúng · tài nguyên đi kèm · link ngoài
+  /**
+   * Bước bất đồng bộ trước khi phân tích: bóc nội dung nhúng (base64 / gzip…) trong card và mở các tệp tài nguyên
+   * (tệp đi kèm, tệp tải từ link ngoài). loader(meta) -> Uint8Array | null: đọc dữ liệu tệp đã lưu.
+   */
+  async prepare(loader) {
+    this.cardEmbeds = await unpackCardItems(this.card);
+    this.resources = [];
+    for (const meta of this.data.resources) this.resources.push(await this.openRes(meta, loader ? await loader(meta).catch(() => null) : null));
+    this.rebuildItems();
+  }
+
+  async openRes(meta, bytes) {
+    const r = { meta, open: null, error: null };
+    try {
+      if (!bytes) throw new Error('không tìm thấy dữ liệu của tệp (data/resources) — hãy thêm lại tệp');
+      r.open = await openResource(meta.name, bytes, { baseUrl: meta.origin === 'url' ? meta.url : null, mime: meta.mime });
+    } catch (e) { r.error = String(e.message || e); }
+    return r;
+  }
+
+  /**
+   * Thêm (hoặc thay — cùng id / cùng URL) một tệp tài nguyên. meta: { id?, name, origin: 'file'|'url', url?, mime? }.
+   * Trả về bản ghi tài nguyên { meta, open, error }; gọi rescan() sau đó. Tệp không đọc được -> ném lỗi, không thêm.
+   */
+  async addResource(meta, bytes) {
+    const m = { id: meta.id || uuid().slice(0, 13), name: meta.name || 'resource', size: bytes.length, origin: meta.origin || 'file', addedAt: Date.now() };
+    if (m.origin === 'url') { m.url = meta.url; m.mode = meta.mode || 'inline'; if (meta.remapUrl) m.remapUrl = meta.remapUrl; if (meta.mime) m.mime = meta.mime; }
+    const r = await this.openRes(m, bytes);
+    if (r.error) throw new Error(r.error);
+    const dup = this.data.resources.findIndex((x) => x.id === m.id || (m.origin === 'url' && x.origin === 'url' && x.url === m.url));
+    if (dup >= 0) {
+      m.id = this.data.resources[dup].id;
+      if (m.origin === 'url') { m.mode = this.data.resources[dup].mode || m.mode; if (this.data.resources[dup].remapUrl) m.remapUrl = this.data.resources[dup].remapUrl; }
+      this.data.resources[dup] = m;
+      this.resources[dup] = r;
+    } else { this.data.resources.push(m); this.resources.push(r); }
+    this.packed.clear();
+    this.rebuildItems();
+    this.touch();
+    return r;
+  }
+
+  removeResource(id) {
+    const i = this.data.resources.findIndex((x) => x.id === id);
+    if (i < 0) return false;
+    this.data.resources.splice(i, 1);
+    this.resources.splice(i, 1);
+    this.packed.clear();
+    this.rebuildItems();
+    this.touch();
+    return true;
+  }
+
+  keepSet(itemId) {
+    const list = this.data.keepFields[itemId];
+    return list && list.length ? new Set(list) : null;
+  }
+
+  /** Bật/tắt "không dịch" cho một trường dữ liệu (tên khóa JSON) của một lớp; cần gọi analyze() sau đó */
+  setKeepField(itemId, field, keep) {
+    const cur = new Set(this.data.keepFields[itemId] || []);
+    if (keep) cur.add(field); else cur.delete(field);
+    if (cur.size) this.data.keepFields[itemId] = [...cur]; else delete this.data.keepFields[itemId];
+    const it = this.itemById.get(itemId);
+    if (it?.meta) it.meta.keepFields = this.keepSet(itemId);
+    this.touch();
+  }
+
+  /** Dựng lại danh sách mục: mục của card (đã thay payload / link bằng token) + các lớp nhúng + các tệp tài nguyên */
+  rebuildItems() {
+    const urlRes = this.resources.filter((r) => r.open && r.meta.origin === 'url' && r.meta.url);
+    const urls = urlRes.map((r) => r.meta.url);
+    this.urlRes = new Map(urlRes.map((r) => [stableId(r.meta.url), r]));
+    const items = [];
+    this.layers = new Map();
+    const withUrls = (text) => (urls.length ? tokenizeUrls(text, urls) : text);
+    const addLayers = (parts, parent, group, resId) => {
+      for (const p of parts || []) {
+        if (this.layers.has(p.id)) continue; // payload giống hệt nhau dùng chung một lớp
+        const id = 'emb.' + p.id;
+        const title = p.hint || describeEncoding(p);
+        const item = {
+          id, path: ['emb', p.id], group, kind: p.kind, sig: 'L' + p.id,
+          label: `${parent.meta?.title || parent.label} › ${title}`,
+          text: withUrls(p.text),
+          meta: { layer: true, title: `${parent.meta?.title || parent.label} › ${title}`, parent: parent.id, resource: resId, enc: describeEncoding(p), size: p.rawLen, keepFields: this.keepSet(id) },
+        };
+        this.layers.set(p.id, { part: p, item, resId });
+        items.push(item);
+        addLayers(p.parts, item, group, resId);
+      }
+    };
+    const embedded = [];
+    for (const it of this.baseItems) {
+      let item = it;
+      const e = this.cardEmbeds.get(it.id);
+      if (e && e.src === it.text) item = { ...it, text: e.text, rawText: it.text, embeds: e.parts };
+      if (urls.length && typeof item.text === 'string') {
+        const t = withUrls(item.text);
+        if (t !== item.text) item = { ...item, text: t, rawText: it.text };
+      }
+      items.push(item);
+      if (item.embeds?.length) embedded.push(item);
+    }
+    for (const it of embedded) addLayers(it.embeds, it, 'embedded', null);
+    for (const r of this.resources) {
+      if (!r.open) continue;
+      const id = 'res.' + r.meta.id;
+      const title = (r.meta.origin === 'url' ? '🔗 ' : '📦 ') + r.meta.name;
+      const root = {
+        id, path: ['res', r.meta.id], group: 'resources', kind: r.open.kind, sig: 'R' + r.meta.id + ':' + r.meta.size + ':' + r.open.rawLen,
+        label: title, text: withUrls(r.open.text),
+        meta: { layer: true, root: true, title, resource: r.meta.id, enc: r.open.container === 'gzip' ? 'gzip' : 'văn bản', size: r.open.rawLen, keepFields: this.keepSet(id) },
+      };
+      items.push(root);
+      addLayers(r.open.parts, root, 'resources', r.meta.id);
+    }
+    this.items = items;
+    this.itemById = new Map(items.map((it) => [it.id, it]));
+    this._links = null;
+  }
+
+  /** Link ngoài tìm thấy trong card và trong các tài nguyên (xem core/links.js), kèm tài nguyên đã tải nếu có */
+  links() {
+    // văn bản các mục chỉ đổi khi dựng lại danh sách mục -> quét URL một lần rồi nhớ
+    this._links ||= scanLinks(this.items);
+    return this._links.map((l) => ({ ...l, resource: this.urlRes.get(l.id) || null }));
+  }
+
+  /** Các mục thuộc một tệp tài nguyên (mục gốc + mọi lớp nhúng bên trong) */
+  resourceItems(resId) { return this.items.filter((it) => it.meta?.resource === resId); }
+
+  // ------------------------------------------------------------------ ghép lại payload / link sau dịch
+  /** Giá trị thay cho một token khi ghép kết quả: payload đã mã hóa lại (nếu đã pack()), không thì payload / URL gốc */
+  tokenValue(type, id) {
+    if (type === 'emb') {
+      const L = this.layers.get(id);
+      if (!L) return null;
+      const c = this.packed.get('emb:' + id);
+      return c ? { value: c.value, changed: true } : { value: L.part.orig, changed: false };
+    }
+    const r = this.urlRes.get(id);
+    if (!r) return null;
+    const mode = r.meta.mode || 'inline';
+    if (mode === 'remap' && r.meta.remapUrl) return { value: r.meta.remapUrl, changed: r.meta.remapUrl !== r.meta.url };
+    const c = mode === 'inline' ? this.packed.get('url:' + id) : null;
+    return c ? { value: c.value, changed: true } : { value: r.meta.url, changed: false };
+  }
+
+  /** Thay token trong văn bản bằng giá trị hiện có. Trả về { text, changed } */
+  finalText(text) {
+    let changed = false;
+    if (!hasToken(text)) return { text, changed };
+    const out = resolveTokens(text, (type, id) => { const v = this.tokenValue(type, id); if (!v) return null; if (v.changed) changed = true; return v.value; });
+    return { text: out, changed };
+  }
+
+  /** Bộ đóng gói dùng chung trong một lượt: mỗi lớp chỉ mã hóa lại một lần, từ lớp trong cùng ra ngoài */
+  packer(settings = this.settings) {
+    const memo = new Map();
+    const inner = async (itemId, path) => {
+      const it = this.itemById.get(itemId);
+      if (!it) return { text: '', changed: false };
+      const out = String(this.output(itemId, settings) ?? '');
+      let changed = out !== it.text;
+      const vals = new Map();
+      for (const [type, id] of listTokens(out)) {
+        const key = type + ':' + id;
+        if (vals.has(key)) continue;
+        const r = await one(type, id, path);
+        if (!r) continue;
+        vals.set(key, r.value);
+        if (r.changed) changed = true;
+      }
+      return { text: vals.size ? resolveTokens(out, (type, id) => vals.get(type + ':' + id)) : out, changed };
+    };
+    const compute = async (type, id, path) => {
+      const key = type + ':' + id;
+      if (type === 'emb') {
+        const L = this.layers.get(id);
+        if (!L) return null;
+        const r = await inner(L.item.id, path);
+        if (!r.changed) { this.packed.delete(key); return { value: L.part.orig, changed: false }; }
+        const sig = hash32(r.text) + ':' + r.text.length;
+        const c = this.packed.get(key);
+        if (c && c.sig === sig) return { value: c.value, changed: true };
+        const value = await encodePart(L.part, r.text);
+        this.packed.set(key, { sig, value });
+        return { value, changed: true };
+      }
+      const res = this.urlRes.get(id);
+      if (!res) return null;
+      const mode = res.meta.mode || 'inline';
+      if (mode === 'remap' && res.meta.remapUrl) return { value: res.meta.remapUrl, changed: res.meta.remapUrl !== res.meta.url };
+      if (mode !== 'inline' || res.open.container !== 'plain') return { value: res.meta.url, changed: false };
+      const r = await inner('res.' + res.meta.id, path);
+      if (!r.changed) { this.packed.delete(key); return { value: res.meta.url, changed: false }; }
+      const sig = hash32(r.text) + ':' + r.text.length;
+      const c = this.packed.get(key);
+      if (c && c.sig === sig) return { value: c.value, changed: true };
+      const value = toDataUrl(res.open.kind, r.text);
+      this.packed.set(key, { sig, value });
+      return { value, changed: true };
+    };
+    // path: các token đang được tính ở phía trên (lớp tự tham chiếu chính nó -> dùng giá trị gốc, không lặp vô hạn)
+    const one = (type, id, path = []) => {
+      const key = type + ':' + id;
+      if (path.includes(key)) return Promise.resolve(null);
+      if (!memo.has(key)) memo.set(key, compute(type, id, [...path, key]));
+      return memo.get(key);
+    };
+    return { one, inner };
+  }
+
+  /**
+   * Mã hóa lại mọi lớp nhúng / link ngoài đã dịch mà card dùng tới, để buildCard() ghép được card hoàn chỉnh.
+   * (Tệp tài nguyên đi kèm được đóng gói riêng khi xuất — exportResource().)
+   */
+  async pack(settings = this.settings) {
+    const { one } = this.packer(settings);
+    for (const it of this.baseItems) {
+      const cur = this.itemById.get(it.id);
+      if (!cur || cur.rawText === undefined) continue;
+      const out = this.output(it.id, settings);
+      if (typeof out !== 'string') continue;
+      for (const [type, id] of listTokens(out)) await one(type, id);
+    }
+    this.packedVersion = this.version;
+  }
+
+  /** Card có lớp nhúng / link ngoài nào cần pack() trước khi ghép không */
+  needsPack() { return this.items.some((it) => it.rawText !== undefined && hasToken(it.text)); }
+
+  /** Xuất một tệp tài nguyên đã dịch, đúng dạng vỏ gốc. Trả về { name, bytes, changed } */
+  async exportResource(resId, settings = this.settings) {
+    const r = this.resources.find((x) => x.meta.id === resId);
+    if (!r || !r.open) throw new Error('Tài nguyên chưa được mở' + (r?.error ? ': ' + r.error : ''));
+    const { inner } = this.packer(settings);
+    const f = await inner('res.' + resId, []);
+    return { name: exportName(r.meta.name), bytes: await packResource(r.open, f.text), changed: f.changed };
+  }
 
   // ------------------------------------------------------------------ quét & phân tích
   /**
@@ -278,7 +556,8 @@ export class Project {
   updateCard(card, settings = this.settings) {
     const allIds = () => this.items.map((it) => it.id);
     const old = {
-      card: this.card, items: this.items, raw: this.data.card, fileName: this.data.fileName, format: this.data.format, imageB64: this.data.imageB64,
+      card: this.card, items: this.items, baseItems: this.baseItems, cardEmbeds: this.cardEmbeds,
+      raw: this.data.card, fileName: this.data.fileName, format: this.data.format, imageB64: this.data.imageB64,
       dict: this.data.dict, dictArchive: { ...(this.data.dictArchive || {}) }, overrides: this.data.overrides, excluded: this.data.excluded,
       warnings: { ...this.data.warnings }, tmKeys: new Set(this.tm.keys()), stale: (this.data.staleOverrides || []).slice(), updates: (this.data.updates || []).slice(),
     };
@@ -293,7 +572,13 @@ export class Project {
     this.data.card = card.raw;
     this.data.fileName = card.fileName;
     this.data.format = card.format;
-    const newItems = listItems(card);
+    // card.embeds: kết quả unpackCardItems(card) do nơi gọi chuẩn bị trước (bất đồng bộ); không có thì coi như card
+    // mới không có nội dung nhúng. Tệp tài nguyên / link đã tải được giữ nguyên.
+    this.baseItems = listItems(card);
+    this.cardEmbeds = card.embeds || new Map();
+    this.packed.clear();
+    this.rebuildItems();
+    const newItems = this.items;
     const match = matchItems(old.items, newItems);
 
     // chỉnh tay: chỉ mang sang khi văn bản nguồn của mục không đổi; nguồn đã đổi -> cất lại để người dùng xem
@@ -311,8 +596,6 @@ export class Project {
     this.data.overrides = overrides;
     this.data.excluded = excluded;
     if (dropped.length) this.data.staleOverrides = [...old.stale, ...dropped].slice(-50);
-    this.items = newItems;
-    this.itemById = new Map(newItems.map((it) => [it.id, it]));
     this.rescan(settings);
     const reused = this.reuseTranslations();
     this.recheckWarnings(settings);
@@ -358,8 +641,10 @@ export class Project {
       this.data.staleOverrides = old.stale; this.data.updates = old.updates;
       for (const k of [...this.tm.keys()]) if (!old.tmKeys.has(k)) this.tm.delete(k);
       this.data.warnings = old.warnings;
-      this.items = old.items;
-      this.itemById = new Map(old.items.map((it) => [it.id, it]));
+      this.baseItems = old.baseItems;
+      this.cardEmbeds = old.cardEmbeds;
+      this.packed.clear();
+      this.rebuildItems();
       this.rescan(settings);
       this.touch();
     };
@@ -401,10 +686,25 @@ export class Project {
     this.segByKey = new Map();
     const pinNote = 'Tên mục này được EJS/script ghép động (vd getwi(null, tênSách + " / 第" + n + "章")) nên được giữ nguyên để mã vẫn tìm thấy mục.';
     const dynNote = dyn.dynamic.length ? `Có lời gọi getwi()/activewi() lấy tên mục lorebook từ biến (${dyn.dynamic.slice(0, 3).join(' · ')}) — nếu mục không được tìm thấy sau khi dịch, hãy tắt "Dịch tên mục lorebook" ở tab Cài đặt dịch.` : null;
+    // lớp lớn (tài nguyên hàng chục MB): kết quả phân tích chỉ phụ thuộc văn bản, LOẠI của các mục từ điển, tên mục
+    // lorebook và cài đặt phân tích -> nhớ lại, chỉ phân tích lại khi một trong số đó đổi
+    let ctxSig = null;
+    const sigOf = () => (ctxSig ??= hash32(Object.entries(this.data.dict).map(([k, v]) => k + '\u0001' + v.kind).join('\u0002')) + '|' + JSON.stringify(ctx.opts) + '|' + hash32([...ctx.entryNames].join('\u0002')) + '|' + [...bookNames].join('\u0002'));
+    const live = new Set();
+    const cached = (it) => {
+      if (!it.meta?.layer || typeof it.text !== 'string' || it.text.length < BIG_ITEM) return analyzeItem(it, ctx);
+      const sig = sigOf() + '|' + (it.meta.keepFields ? [...it.meta.keepFields].sort().join('\u0002') : '') + '|' + it.sig;
+      live.add(it.id);
+      const c = this.anCache.get(it.id);
+      if (c && c.sig === sig) return c.a;
+      const a = analyzeItem(it, ctx);
+      this.anCache.set(it.id, { sig, a });
+      return a;
+    };
     for (const it of this.items) {
       const a = it.kind === 'comment' && this.pinnedEntries.has(it.text)
         ? { segments: [], warnings: [pinNote], render: () => it.text, pinned: true }
-        : analyzeItem(it, ctx);
+        : cached(it);
       if (dynNote && typeof it.text === 'string' && /getwi|getWorldInfo|activewi|activateWorldInfo/.test(it.text) && !a.warnings.includes(dynNote)) a.warnings.push(dynNote);
       this.analyses.set(it.id, a);
       for (const s of a.segments) {
@@ -413,6 +713,7 @@ export class Project {
         e.items.add(it.id);
       }
     }
+    for (const id of [...this.anCache.keys()]) if (!live.has(id)) this.anCache.delete(id);
     this.settings = settings;
     this.bump();
   }
@@ -543,9 +844,22 @@ export class Project {
   touch() { this.data.updatedAt = Date.now(); this.dirty = true; }
 
   // ------------------------------------------------------------------ xuất
+  /**
+   * Ghép card đã dịch. Token của lớp nhúng / link ngoài được thay bằng payload đã mã hóa lại — cần `await pack()` trước
+   * (xuất card luôn làm vậy); lớp chưa được pack() dùng payload GỐC nên card vẫn chạy được, chỉ là lớp đó chưa dịch.
+   */
   buildCard(settings = this.settings) {
     const outputs = new Map();
-    for (const it of this.items) outputs.set(it.id, this.output(it.id, settings));
+    for (const it of this.baseItems) {
+      const cur = this.itemById.get(it.id) || it;
+      let v = this.output(it.id, settings);
+      if (cur.rawText !== undefined && typeof v === 'string') {
+        const f = this.finalText(v);
+        // không có gì thay đổi -> trả lại đúng văn bản gốc (kể cả cách viết \uXXXX ban đầu)
+        v = v === cur.text && !f.changed ? cur.rawText : f.text;
+      }
+      outputs.set(it.id, v);
+    }
     return buildTranslatedCard(this.card, outputs);
   }
 

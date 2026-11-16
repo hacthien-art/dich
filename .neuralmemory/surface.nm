@@ -5,9 +5,9 @@
 # ═══════════════════════════════════════════════════
 ---
 brain: default
-updated: 2026-11-15T08:27:01
+updated: 2026-11-16T13:12:15
 neurons: 1588
-synapses: 50403
+synapses: 50447
 token_budget: 1200
 depth_available: [surface, detail, deep]
 ---
@@ -25,30 +25,30 @@ depth_available: [surface, detail, deep]
   →alias→ "Error: fix in apiclient"
 
 [c10] The debugger allows viewing network traffic of browser targets and Node.js… (concept) {p:3}
+  →related_to→ "viewing network"
   →co_occurs→ "When debugging web apps, you can configure instrumentation…"
   →related_to→ "traffic browser"
   →co_occurs→ "On a function's return statement, you can use, inspect,…"
-  →co_occurs→ "The debugger can pretty print files, especially useful…"
-  →related_to→ "allows viewing"
+  →related_to→ "network traffic"
 
 [c11] Project: web (concept) {p:3}
   →related_to→ [c3] "SillyTavern"
   →stored_by→ "Project: web"
-  →related_to→ "web"
-  →related_to→ "project"
-  →related_to→ "DOM"
+  →related_to→ "Vietnamese"
+  →related_to→ "Horae"
+  →related_to→ "Horae"
 
 [c12] This extension supports running npm scripts defined in the `package.json` as… (concept) {p:3}
   →related_to→ "scripts defined"
   →co_occurs→ "This is a custom editor that provides tablular information…"
   →co_occurs→ "A companion extension to [js-debug](https://github.com/micr…"
+  →involves→ "npm"
   →co_occurs→ "Microsoft takes the security of our software products and…"
-  →has_value→ "This extension supports running npm scripts defined in the…"
 
 [c13] Phase 1 Dexie Migration for VietTruyen App completed (initial implementation).… (concept) {p:3}
   →involves→ "storageService"
   →stored_by→ "Phase 1 Dexie Migration for VietTruyen App completed…"
-  →related_to→ "dexie migration"
+  →involves→ "4 new files in src/db/:"
   →related_to→ "dexie migration"
   →related_to→ "dexie migration"
 
@@ -58,13 +58,11 @@ depth_available: [surface, detail, deep]
   →co_occurs→ "Keywords"
 
 [c2] character card (concept) {p:5}
-  →related_to→ "2026-05-18 02:07"
   →related_to→ "Error: batch translation timeout\\n\\n## related…"
-  →related_to→ "Error: batch translation timeout\n\n## related…"
 
 [c3] SillyTavern (concept) {p:5}
   →co_occurs→ "Tech"
-  →co_occurs→ "GDD"
+  →related_to→ "SillyTavern HTML"
 
 [c1] Card Translation Entry Bug Fixes (2026-04-15): (1) Entry name drift â€” khi… (concept) {p:7}
   →involves→ "Variable"
@@ -77,10 +75,10 @@ depth_available: [surface, detail, deep]
 # Auto-detected topic groups from brain.db entity co-occurrence.
 # Agent: use clusters to scope recall queries.
 
-@variable: [06cf57dd-ef43-46ec-bb15-19b62c8f30b8, 08424fba-ce84-4ced-a266-d81bb115d76c] "Variable, Card Translation Entry Bug Fixes (2026-0"
-@render: [01805830-36a9-42f6-bd43-6e607a1f5930, 03dcc46b-266f-4010-95cb-73277a80bbf3] "Render, WebSocket"
-@pass: [11f2f022-23b1-4be9-8510-c2ef9ca0aee2, 2962a696-479a-47a8-825d-3aa52a87674b, 2d757904-853e-457c-a9ef-a0674be74754, 358f0944-dae2-4cae-842c-f48174462035, 476325c5-7c68-4207-8053-0a332b4d8f65] "- Pass 3.4 = Naga + Centaur + Minotaur +, - Pass 3.3 = ThÃº NhÃ¢n + Tháº±n Láº±n N, - Pass 3.2 = NgÆ°á»���i LÃ¹n + Ogre + Ä�"
-@phase: [0100d2db-192d-41b2-b9fd-1586c198d6db, cb5ffffd-f388-425a-96e8-effec6895298] "Phase 3 (Pass 3.1â€“3.7) = Chá»§ng tá»™c, Nighoh"
+@card: [06cf57dd-ef43-46ec-bb15-19b62c8f30b8, 08424fba-ce84-4ced-a266-d81bb115d76c] "Card Translation Entry Bug Fixes (2026-0, Variable"
+@websocket: [01805830-36a9-42f6-bd43-6e607a1f5930, 03dcc46b-266f-4010-95cb-73277a80bbf3] "WebSocket, Render"
+@pass: [11f2f022-23b1-4be9-8510-c2ef9ca0aee2, 2962a696-479a-47a8-825d-3aa52a87674b, 2d757904-853e-457c-a9ef-a0674be74754, 358f0944-dae2-4cae-842c-f48174462035, 476325c5-7c68-4207-8053-0a332b4d8f65] "- Pass 3.4 = Naga + Centaur + Minotaur +, - Pass 3.3 = ThÃº NhÃ¢n + Tháº±n Láº±n N, - Pass 3.1 = [báº¯t Ä‘áº§u] + NhÃ¢n Loáº"
+@nighoh: [0100d2db-192d-41b2-b9fd-1586c198d6db, cb5ffffd-f388-425a-96e8-effec6895298] "Nighoh, Phase 3 (Pass 3.1â€“3.7) = Chá»§ng tá»™c"
 @error: [00a12bb9-50e6-4d8a-a6b2-75f03e980b61, 03b07608-35c2-4861-901d-1eed7e0d8f01] "Error: fix in apiclient"
 
 # ── DEPTH MAP ──────────────────────────────────────
@@ -88,8 +86,9 @@ depth_available: [surface, detail, deep]
 # Format: [id] → depth_hint (context)
 
 [c1] → NEEDS_DEEP (30 synapses in brain.db, recall "Card Translation Entry Bug Fixes…")
+[c2] → NEEDS_DEEP (4 synapses in brain.db, recall "character card")
 [c3] → NEEDS_DETAIL (3 total synapses, recall "SillyTavern")
-[c9] → NEEDS_DEEP (1212 synapses in brain.db, recall "Error: fix in apiclient")
+[c9] → NEEDS_DEEP (1213 synapses in brain.db, recall "Error: fix in apiclient")
 [c10] → NEEDS_DETAIL (14 total synapses, recall "The debugger allows viewing network…")
 [c11] → NEEDS_DETAIL (12 total synapses, recall "Project: web")
 [c12] → NEEDS_DEEP (16 synapses in brain.db, recall "This extension supports running npm…")
@@ -100,5 +99,5 @@ depth_available: [surface, detail, deep]
 
 coverage: 0.02
 staleness: 1.0
-last_consolidation: 2026-11-15T08:27:01
+last_consolidation: 2026-11-16T13:12:15
 top_entities: [Card, The, -, TaoCard, Nighoh]
